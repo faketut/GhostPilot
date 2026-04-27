@@ -9,6 +9,7 @@ flowchart TD
   subgraph UI[Overlay Windows]
     ASR_UI["ASR Overlay (🎙️)<br/>streamed Q/A"]
     V_UI["Vision Overlay (📸)<br/>streamed vision answer"]
+=======
   end
 
   subgraph Audio[Audio / ASR Pipeline]
