@@ -21,7 +21,7 @@ flowchart TD
   end
 
   subgraph Vision[Vision Pipeline (Independent)]
-    HKP["Hotkey Alt+P"]
+    HKP["Hotkey (Alt+P)"]
     CAP["AreaCapture (Qt overlay)<br/>→ JPEG compress"]
     VLLM["Vision LLM<br/>(Gemini via google-genai)"]
   end
@@ -91,4 +91,3 @@ On startup the app will:
 
 - **PyQt6 DLL load failed**: prefer installing PyQt/Qt via conda-forge (`conda install -c conda-forge pyqt=6 qt-main`) and make sure VC++ 2015-2022 x64 runtime is installed.
 - **Alt+P / Vision failures**: vision pipeline is isolated; failures should show only in the Vision overlay and not stop ASR.
-
