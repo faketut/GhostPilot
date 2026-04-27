@@ -7,23 +7,23 @@ Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LL
 ```mermaid
 flowchart TD
   subgraph UI[Overlay Windows]
-    ASR_UI[ASR Overlay (🎙️)\nstreamed Q/A]
-    V_UI[Vision Overlay (📸)\nstreamed vision answer]
+    ASR_UI["ASR Overlay (🎙️)<br/>streamed Q/A"]
+    V_UI["Vision Overlay (📸)<br/>streamed vision answer"]
   end
 
   subgraph Audio[Audio / ASR Pipeline]
-    AC[WASAPI Loopback Capture\n(silence padding)]
-    WD[Audio Watchdog\n(auto restart)]
+    AC["WASAPI Loopback Capture<br/>(silence padding)"]
+    WD["Audio Watchdog<br/>(auto restart)"]
     AZ[Azure Speech (partial/final)]
-    SEG[Partial Segmenter\n(punct / timeout)]
-    RAG[RAGManager\n(knowledge/ chunks)]
-    TEXTLLM[Text LLM\n(OpenAI-compatible)]
+    SEG["Partial Segmenter<br/>(punct / timeout)"]
+    RAG["RAGManager<br/>(knowledge/ chunks)"]
+    TEXTLLM["Text LLM<br/>(OpenAI-compatible)"]
   end
 
   subgraph Vision[Vision Pipeline (Independent)]
     HKP[Hotkey Alt+P]
-    CAP[AreaCapture (Qt overlay)\n→ JPEG compress]
-    VLLM[Vision LLM\n(Gemini via google-genai)]
+    CAP["AreaCapture (Qt overlay)<br/>→ JPEG compress"]
+    VLLM["Vision LLM<br/>(Gemini via google-genai)"]
   end
 
   AC --> AZ --> SEG --> TEXTLLM --> ASR_UI
