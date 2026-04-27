@@ -9,13 +9,12 @@ flowchart TD
   subgraph UI[Overlay Windows]
     ASR_UI["ASR Overlay (🎙️)<br/>streamed Q/A"]
     V_UI["Vision Overlay (📸)<br/>streamed vision answer"]
-=======
   end
 
   subgraph Audio[Audio / ASR Pipeline]
     AC["WASAPI Loopback Capture<br/>(silence padding)"]
     WD["Audio Watchdog<br/>(auto restart)"]
-    AZ[Azure Speech (partial/final)]
+    AZ["Azure Speech (partial/final)"]
     SEG["Partial Segmenter<br/>(punct / timeout)"]
     RAG["RAGManager<br/>(knowledge/ chunks)"]
     TEXTLLM["Text LLM<br/>(OpenAI-compatible)"]
