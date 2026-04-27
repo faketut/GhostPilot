@@ -20,7 +20,7 @@ flowchart TD
     TEXTLLM["Text LLM<br/>(OpenAI-compatible)"]
   end
 
-  subgraph Vision[Vision Pipeline (Independent)]
+  subgraph Vision[Vision Pipeline - Independent]
     HKP["Hotkey (Alt+P)"]
     CAP["AreaCapture (Qt overlay)<br/>→ JPEG compress"]
     VLLM["Vision LLM<br/>(Gemini via google-genai)"]
