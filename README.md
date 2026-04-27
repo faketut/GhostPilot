@@ -7,8 +7,8 @@ Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LL
 ```mermaid
 flowchart TD
   subgraph UI[Overlay Windows]
-    ASR_UI[ASR Overlay (🎙️)\nstreamed Q/A]
-    V_UI[Vision Overlay (📸)\nstreamed vision answer]
+    ASR_UI[ASR Overlay Q/A]
+    V_UI[Vision Overlay vision answer]
   end
 
   subgraph Audio[Audio / ASR Pipeline]
