@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+from typing import Callable, Optional
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QMessageBox,
@@ -59,7 +60,7 @@ QPushButton#cancelBtn:hover { background-color: #585b70; }
 
 
 class SettingsUI(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, on_saved: Optional[Callable[[dict], None]] = None):
         super().__init__(parent)
         self.setWindowTitle("GhostPilot Copilot — Settings")
         self.setMinimumWidth(460)
@@ -69,6 +70,7 @@ class SettingsUI(QDialog):
             | Qt.WindowType.WindowStaysOnTopHint
         )
 
+        self._on_saved = on_saved
         self.saved_config = self._load_config()
         root = QVBoxLayout(self)
         root.setSpacing(12)
@@ -132,6 +134,22 @@ class SettingsUI(QDialog):
         hk_form.addRow("Toggle Interaction:", self.interaction_hk_input)
         root.addWidget(hk_group)
 
+        # ── Language ─────────────────────────────────────────────────────
+        lang_group = QGroupBox("🌐 Language / 输出语言")
+        lang_form = QFormLayout(lang_group)
+
+        self.response_lang_combo = QComboBox()
+        self.response_lang_combo.addItem("Auto (跟随问题语言)", "auto")
+        self.response_lang_combo.addItem("中文 (Chinese)", "zh")
+        self.response_lang_combo.addItem("English", "en")
+        current_lang = self.saved_config.get("RESPONSE_LANGUAGE", getattr(config, "RESPONSE_LANGUAGE", "auto"))
+        for i in range(self.response_lang_combo.count()):
+            if self.response_lang_combo.itemData(i) == current_lang:
+                self.response_lang_combo.setCurrentIndex(i)
+                break
+        lang_form.addRow("LLM response language:", self.response_lang_combo)
+        root.addWidget(lang_group)
+
         # ── Buttons ───────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         save_btn = QPushButton("💾 Save")
@@ -176,6 +194,7 @@ class SettingsUI(QDialog):
             "VISION_MODEL": self.vision_model_input.text().strip(),
             "SCREENSHOT_HOTKEY": self.screenshot_hk_input.text().strip(),
             "INTERACTION_HOTKEY": self.interaction_hk_input.text().strip(),
+            "RESPONSE_LANGUAGE": self.response_lang_combo.currentData(),
         }
 
         try:
@@ -187,9 +206,15 @@ class SettingsUI(QDialog):
                 if hasattr(config, k):
                     setattr(config, k, v)
 
+            if self._on_saved:
+                try:
+                    self._on_saved(new_cfg)
+                except Exception as e:
+                    logger.error(f"Settings on_saved callback failed: {e}")
+
             QMessageBox.information(
                 self, "Saved",
-                "Settings saved.\nRestart the app for hotkey and speech provider changes to take effect."
+                "Settings saved.\nMost changes apply immediately."
             )
             self.accept()
         except Exception as e:

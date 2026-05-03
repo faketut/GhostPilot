@@ -21,7 +21,7 @@ flowchart TD
   end
 
   subgraph Vision[Vision Pipeline (Independent)]
-    HKP[Hotkey Alt+P]
+    HKP["Hotkey Alt+P"]
     CAP["AreaCapture (Qt overlay)<br/>→ JPEG compress"]
     VLLM["Vision LLM<br/>(Gemini via google-genai)"]
   end

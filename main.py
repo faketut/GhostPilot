@@ -52,8 +52,8 @@ async def run_pipelines(app, loop):
     apply_saved_config()
 
     # ── Initialize modules ────────────────────────────────────────────────
-    ui_asr = OverlayUI(title="GhostPilot · ASR", with_tray=True, start_y=20, accent="🎙️ ASR")
-    ui_vision = OverlayUI(title="GhostPilot · Vision", with_tray=False, start_y=310, accent="📸 Vision")
+    ui_asr = None
+    ui_vision = None
 
     audio_capture = AudioCapture(sample_rate=config.SAMPLE_RATE, chunk_size=config.CHUNK_SIZE)
     asr_client = ASRClient(
@@ -113,18 +113,71 @@ async def run_pipelines(app, loop):
 
     audio_watchdog_task = loop.create_task(audio_watchdog())
 
+    asr_task = None
+    ui_task_asr = None
+    ui_task_vision = None
+
+    hk_screenshot = None
+    hk_interactions = []
+
+    def _apply_overlay_opacity():
+        try:
+            if ui_asr is not None:
+                ui_asr.setWindowOpacity(float(getattr(config, "OVERLAY_OPACITY", 1.0)))
+            if ui_vision is not None:
+                ui_vision.setWindowOpacity(float(getattr(config, "OVERLAY_OPACITY", 1.0)))
+        except Exception as e:
+            logger.warning(f"Failed to apply overlay opacity: {e}")
+
+    def _restart_asr():
+        nonlocal asr_task, asr_client
+        try:
+            asr_client.stop()
+        except Exception:
+            pass
+        if asr_task is not None and not asr_task.done():
+            asr_task.cancel()
+        # Recreate client to pick up new keys/region/endpoint/language
+        try:
+            asr_client = ASRClient(
+                config.AZURE_SPEECH_KEY,
+                config.AZURE_SPEECH_REGION,
+                config.AZURE_SPEECH_ENDPOINT,
+            )
+        except Exception as e:
+            logger.error(f"Failed to recreate ASR client: {e}")
+            return
+        asr_task = loop.create_task(asr_client.start_streaming(audio_queue, text_queue, loop))
+
+    def on_settings_saved(_new_cfg: dict):
+        """
+        Called after Settings UI writes config.json and hot-patches `config`.
+        Apply runtime changes without restart.
+        """
+        try:
+            # Apply lightweight UI changes immediately
+            _apply_overlay_opacity()
+
+            # LLM clients may need recreation (provider/key/model changes)
+            llm_engine.reload_clients()
+
+            # Hotkeys are registered once → rebuild to apply new bindings
+            _rebuild_hotkeys()
+
+            # ASR language/keys changes require restarting the Azure transcriber
+            _restart_asr()
+        except Exception as e:
+            logger.error(f"Runtime settings apply failed: {e}")
+
+    # Create overlays after we have the callback
+    ui_asr = OverlayUI(title="GhostPilot · ASR", with_tray=True, start_y=20, accent="🎙️ ASR", on_settings_saved=on_settings_saved)
+    ui_vision = OverlayUI(title="GhostPilot · Vision", with_tray=False, start_y=310, accent="📸 Vision", on_settings_saved=on_settings_saved)
+    # Start UI updaters and ASR now that UIs exist
     asr_task = loop.create_task(asr_client.start_streaming(audio_queue, text_queue, loop))
     ui_task_asr = loop.create_task(ui_updater(ui_asr, ui_queue_asr))
     ui_task_vision = loop.create_task(ui_updater(ui_vision, ui_queue_vision))
 
     # ── Hotkey: Alt+P — area-select screenshot → Vision LLM ──────────────
-    logger.info(
-        "Hotkeys effective: "
-        f"SCREENSHOT_HOTKEY={config.SCREENSHOT_HOTKEY!r}, "
-        f"ASR_INTERACTION_HOTKEY={getattr(config, 'ASR_INTERACTION_HOTKEY', '')!r}, "
-        f"VISION_INTERACTION_HOTKEY={getattr(config, 'VISION_INTERACTION_HOTKEY', '')!r}, "
-        f"INTERACTION_HOTKEY(all)={getattr(config, 'INTERACTION_HOTKEY', '')!r}"
-    )
     async def on_screenshot():
         logger.info("Alt+P triggered — launching area capture overlay.")
         # Make the overlay show activity immediately.
@@ -146,9 +199,6 @@ async def run_pipelines(app, loop):
         except Exception as e:
             logger.error(f"Screenshot pipeline error: {e}")
             await ui_queue_vision.put({"type": "token", "text": f"\n[⚠️ Vision Error: {e}]"})
-
-    hk_screenshot = HotkeyManager(config.SCREENSHOT_HOTKEY, on_screenshot, loop, suppress=False)
-    hk_screenshot.start()
 
     # ── Hotkey: Alt+A — toggle click-through / interactive mode ──────────
     def on_toggle_asr_interaction():
@@ -187,37 +237,63 @@ async def run_pipelines(app, loop):
             logger.warning(f"No hotkey configured for {label}")
         return hks
 
-    hk_interactions = []
+    def _rebuild_hotkeys():
+        nonlocal hk_screenshot, hk_interactions
+        try:
+            if hk_screenshot is not None:
+                hk_screenshot.stop()
+        except Exception:
+            pass
+        try:
+            for hk in hk_interactions:
+                hk.stop()
+        except Exception:
+            pass
+        hk_interactions = []
 
-    # Preferred: separate per-overlay hotkeys
-    hk_interactions += _start_hotkey_pair(
-        getattr(config, "ASR_INTERACTION_HOTKEY", ""),
-        getattr(config, "ASR_INTERACTION_HOTKEY_BACKUP", ""),
-        on_toggle_asr_interaction,
-        label="ASR interaction",
-    )
-    hk_interactions += _start_hotkey_pair(
-        getattr(config, "VISION_INTERACTION_HOTKEY", ""),
-        getattr(config, "VISION_INTERACTION_HOTKEY_BACKUP", ""),
-        on_toggle_vision_interaction,
-        label="Vision interaction",
-    )
+        logger.info(
+            "Hotkeys effective: "
+            f"SCREENSHOT_HOTKEY={config.SCREENSHOT_HOTKEY!r}, "
+            f"ASR_INTERACTION_HOTKEY={getattr(config, 'ASR_INTERACTION_HOTKEY', '')!r}, "
+            f"VISION_INTERACTION_HOTKEY={getattr(config, 'VISION_INTERACTION_HOTKEY', '')!r}, "
+            f"INTERACTION_HOTKEY(all)={getattr(config, 'INTERACTION_HOTKEY', '')!r}"
+        )
 
-    # Backward compatible: one hotkey toggles both overlays (if set)
-    hk_interactions += _start_hotkey_pair(
-        getattr(config, "INTERACTION_HOTKEY", ""),
-        getattr(config, "INTERACTION_HOTKEY_BACKUP", ""),
-        on_toggle_all_interaction,
-        label="Global interaction",
-    )
+        hk_screenshot = HotkeyManager(config.SCREENSHOT_HOTKEY, on_screenshot, loop, suppress=False)
+        hk_screenshot.start()
 
-    # Force stealth (recommended safety hotkey)
-    hk_interactions += _start_hotkey_pair(
-        getattr(config, "FORCE_STEALTH_HOTKEY", ""),
-        getattr(config, "FORCE_STEALTH_HOTKEY_BACKUP", ""),
-        on_force_stealth,
-        label="Force stealth",
-    )
+        # Preferred: separate per-overlay hotkeys
+        hk_interactions += _start_hotkey_pair(
+            getattr(config, "ASR_INTERACTION_HOTKEY", ""),
+            getattr(config, "ASR_INTERACTION_HOTKEY_BACKUP", ""),
+            on_toggle_asr_interaction,
+            label="ASR interaction",
+        )
+        hk_interactions += _start_hotkey_pair(
+            getattr(config, "VISION_INTERACTION_HOTKEY", ""),
+            getattr(config, "VISION_INTERACTION_HOTKEY_BACKUP", ""),
+            on_toggle_vision_interaction,
+            label="Vision interaction",
+        )
+
+        # Backward compatible: one hotkey toggles both overlays (if set)
+        hk_interactions += _start_hotkey_pair(
+            getattr(config, "INTERACTION_HOTKEY", ""),
+            getattr(config, "INTERACTION_HOTKEY_BACKUP", ""),
+            on_toggle_all_interaction,
+            label="Global interaction",
+        )
+
+        # Force stealth (recommended safety hotkey)
+        hk_interactions += _start_hotkey_pair(
+            getattr(config, "FORCE_STEALTH_HOTKEY", ""),
+            getattr(config, "FORCE_STEALTH_HOTKEY_BACKUP", ""),
+            on_force_stealth,
+            label="Force stealth",
+        )
+
+    # Initial hotkeys registration (also supports runtime reloads)
+    _rebuild_hotkeys()
 
     # ── ASR final transcript → Classifier → LLM ──────────────────────────
     # ASR segmentation: finalize on punctuation or partial-silence timeout.
@@ -306,7 +382,8 @@ async def run_pipelines(app, loop):
         logger.info("Shutting down pipelines...")
         audio_capture.stop()
         asr_client.stop()
-        hk_screenshot.stop()
+        if hk_screenshot:
+            hk_screenshot.stop()
         for hk in hk_interactions:
             hk.stop()
         asr_task.cancel()

@@ -30,12 +30,12 @@ _FALLBACKS: dict[str, str] = {
     "technical": (
         "You are a senior software engineer interview coach. "
         "Answer the technical concept question with: core definition, key points, "
-        "common pitfalls. ≤150 words. Respond in Chinese."
+        "common pitfalls. ≤150 words."
     ),
     "behavioral": (
         "You are a behavioral interview coach. "
         "Answer using the STAR framework (Situation, Task, Action, Result). "
-        "≤150 words. Respond in Chinese."
+        "≤150 words."
     ),
     "vision": (
         "You are a technical interview coach. Analyze the screenshot and provide "

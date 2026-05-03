@@ -26,9 +26,9 @@ from src.settings_ui import SettingsUI
 logger = logging.getLogger(__name__)
 
 # ── Colour palette (matches OpenGhostPilot dark glass aesthetic) ──────────────
-_BG_GLASS = "rgba(15, 15, 20, 180)"
-_BG_HEADER = "rgba(30, 30, 45, 200)"
-_BORDER = "rgba(255, 255, 255, 25)"
+_BG_GLASS = "rgba(15, 15, 20, 210)"
+_BG_HEADER = "rgba(30, 30, 45, 230)"
+_BORDER = "rgba(255, 255, 255, 40)"
 _TEXT_PRIMARY = "#e8eaf6"
 _TEXT_DIM = "#90939e"
 _ACCENT_GREEN = "#4caf50"
@@ -42,6 +42,13 @@ _BADGE = {
     "technical":  ("#7c3aed", "📖 技术"),
     "vision":     ("#065f46", "📸 视觉"),
 }
+
+def _clamp01(x: float) -> float:
+    try:
+        x = float(x)
+    except Exception:
+        return 1.0
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
 
 
 class _PulseDot(QWidget):
@@ -141,6 +148,7 @@ class OverlayUI(QMainWindow):
         with_tray: bool = True,
         start_y: int = 20,
         accent: str = "● GhostPilot",
+        on_settings_saved=None,
     ):
         super().__init__()
         self.is_interactive = True   # toggled by Alt+A
@@ -149,6 +157,7 @@ class OverlayUI(QMainWindow):
         self._with_tray = with_tray
         self._start_y = start_y
         self._accent = accent
+        self._on_settings_saved = on_settings_saved
         self._initUI()
 
     def _initUI(self):
@@ -161,6 +170,11 @@ class OverlayUI(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumSize(QSize(480, 80))
         self.resize(640, 260)
+
+        # ── Config-driven opacity ─────────────────────────────────────────
+        # Note: this affects the entire window (including text). Keep defaults
+        # conservative; background glass already uses alpha in CSS.
+        self.setWindowOpacity(_clamp01(getattr(config, "OVERLAY_OPACITY", 1.0)))
 
         # ── OS-level stealth (invisible to screen capture) ────────────────
         if sys.platform == "win32":
@@ -259,7 +273,7 @@ class OverlayUI(QMainWindow):
         self._tray = tray
 
     def _open_settings(self):
-        dlg = SettingsUI(self)
+        dlg = SettingsUI(self, on_saved=self._on_settings_saved)
         dlg.exec()
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -334,7 +348,7 @@ class OverlayUI(QMainWindow):
             lang = m.group(1) or "text"
             code = m.group(2).strip()
             return (
-                f'<div style="background:rgba(0,0,0,0.4);border-radius:6px;'
+                f'<div style="background:rgba(0,0,0,0.5);border-radius:6px;'
                 f'border:1px solid rgba(255,255,255,0.12);margin:6px 0;padding:8px 12px;">'
                 f'<span style="color:#6b7280;font-size:10px;">{lang}</span><br>'
                 f'<pre style="margin:0;color:#e5e7eb;font-family:Consolas,monospace;'
@@ -345,7 +359,7 @@ class OverlayUI(QMainWindow):
         # Inline `code`
         text = re.sub(
             r"`([^`]+)`",
-            r'<code style="background:rgba(0,0,0,0.35);border-radius:3px;'
+            r'<code style="background:rgba(0,0,0,0.45);border-radius:3px;'
             r'padding:1px 4px;font-family:Consolas,monospace;color:#a8d8a8;">\1</code>',
             text,
         )

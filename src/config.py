@@ -41,9 +41,16 @@ class Config:
     VISION_TIMEOUT_SEC = float(os.getenv("VISION_TIMEOUT_SEC", "8.0"))
 
     # UI Settings
-    OVERLAY_OPACITY = 0.85
+    # 0.0~1.0, higher = more opaque (less transparent)
+    OVERLAY_OPACITY = 0.78
     FONT_FAMILY = "Segoe UI"
     FONT_SIZE = 14
+
+    # Response language preference:
+    # - "auto": follow question language (fallback zh)
+    # - "zh": always Chinese
+    # - "en": always English
+    RESPONSE_LANGUAGE = os.getenv("RESPONSE_LANGUAGE", "auto")
     
     # Hotkeys
     SCREENSHOT_HOTKEY = os.getenv("SCREENSHOT_HOTKEY", "alt+p")

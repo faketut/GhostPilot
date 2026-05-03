@@ -48,13 +48,45 @@ def classify_question(question: str) -> str:
         return "algorithm"
     return "technical"
 
+def _contains_cjk(s: str) -> bool:
+    # Basic CJK detection for language auto-routing.
+    for ch in (s or ""):
+        code = ord(ch)
+        if (
+            0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
+            or 0x3400 <= code <= 0x4DBF  # CJK Extension A
+            or 0x3000 <= code <= 0x303F  # CJK Symbols and Punctuation
+        ):
+            return True
+    return False
+
+def _resolve_response_lang(question: str) -> str:
+    """
+    Returns "zh" or "en" based on config.RESPONSE_LANGUAGE and question text.
+    """
+    pref = (getattr(config, "RESPONSE_LANGUAGE", "auto") or "auto").strip().lower()
+    if pref in ("zh", "cn", "chinese"):
+        return "zh"
+    if pref in ("en", "eng", "english"):
+        return "en"
+    # auto: if any CJK → zh; else default to en only when it's clearly English.
+    if _contains_cjk(question):
+        return "zh"
+    q = (question or "").strip()
+    if not q:
+        return "zh"
+    ascii_ratio = sum(1 for c in q if ord(c) < 128) / max(1, len(q))
+    return "en" if ascii_ratio > 0.92 else "zh"
+
 
 # ── LLM Engine ────────────────────────────────────────────────────────────
 
 class LLMEngine:
     def __init__(self, rag_manager: RAGManager):
         self.rag = rag_manager
+        self._init_clients()
 
+    def _init_clients(self):
         def _is_deepseek_model(model_name: str) -> bool:
             return "deepseek" in (model_name or "").lower()
 
@@ -84,22 +116,34 @@ class LLMEngine:
             self._vision_provider = "openai_compatible"
             self.vision_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 
+    def reload_clients(self):
+        """
+        Recreate LLM clients to apply runtime config changes (keys/models/providers).
+        Safe to call between requests; in-flight requests keep using old clients.
+        """
+        self._init_clients()
+
     # ── Text answer ───────────────────────────────────────────────────────
 
     def _build_messages(
         self, q_type: str, question: str, context_snippets: list[str]
     ) -> list[dict]:
         system_prompt = get_prompt(q_type)
+        lang = _resolve_response_lang(question)
+        if lang == "en":
+            system_prompt = f"{system_prompt}\n\nOutput language: English."
+        else:
+            system_prompt = f"{system_prompt}\n\n输出语言：中文。"
 
         # Inject only the top-3 most relevant resume/JD snippets (minimisation principle)
         context_block = ""
         if context_snippets:
             joined = "\n---\n".join(context_snippets[:3])
-            context_block = f"\n\n[候选人相关背景]\n{joined}"
+            context_block = f"\n\n[Candidate background]\n{joined}" if lang == "en" else f"\n\n[候选人相关背景]\n{joined}"
 
         return [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{context_block}\n\n面试官问题：{question}"},
+            {"role": "user", "content": f"{context_block}\n\nInterviewer question: {question}" if lang == "en" else f"{context_block}\n\n面试官问题：{question}"},
         ]
 
     async def generate_answer_stream(self, question: str, ui_queue: asyncio.Queue):
@@ -156,7 +200,14 @@ class LLMEngine:
 
             # ── Build vision messages ──────────────────────────────────
             system_prompt = get_prompt("vision")
-            user_text = "请分析这道面试题并给出解答："
+            # Vision has no question text; follow preference (auto falls back to zh).
+            lang = _resolve_response_lang("")
+            if lang == "en":
+                system_prompt = f"{system_prompt}\n\nOutput language: English."
+                user_text = "Please analyze this interview question and provide a solution:"
+            else:
+                system_prompt = f"{system_prompt}\n\n输出语言：中文。"
+                user_text = "请分析这道面试题并给出解答："
 
             if self._vision_provider == "gemini":
                 if not config.GEMINI_API_KEY:
