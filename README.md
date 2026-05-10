@@ -67,8 +67,8 @@ All config can be set via:
 
 - **Screenshot (Vision)**:
   - `SCREENSHOT_HOTKEY` (default `alt+p`)
-- **ASR overlay interaction (click-through ↔ draggable)**:
-  - `ASR_INTERACTION_HOTKEY` / `ASR_INTERACTION_HOTKEY_BACKUP`
+- **Both overlays interaction (click-through ↔ draggable, synced)**:
+  - `ASR_INTERACTION_HOTKEY` / `ASR_INTERACTION_HOTKEY_BACKUP` (default `alt+a` / `ctrl+alt+a`)
 - **Vision overlay interaction (click-through ↔ draggable)**:
   - `VISION_INTERACTION_HOTKEY` / `VISION_INTERACTION_HOTKEY_BACKUP`
 - **Safety (force both overlays click-through)**:

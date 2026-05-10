@@ -201,39 +201,74 @@ async def run_pipelines(app, loop):
             await ui_queue_vision.put({"type": "token", "text": f"\n[⚠️ Vision Error: {e}]"})
 
     # ── Hotkey: Alt+A — toggle click-through / interactive mode ──────────
-    def on_toggle_asr_interaction():
-        logger.info("ASR interaction hotkey triggered.")
-        ui_asr.toggle_interaction()
-
     def on_toggle_vision_interaction():
         logger.info("Vision interaction hotkey triggered.")
         ui_vision.toggle_interaction()
 
-    def on_toggle_all_interaction():
-        logger.info("Global interaction hotkey triggered (toggle both overlays).")
-        ui_asr.toggle_interaction()
-        ui_vision.toggle_interaction()
+    def on_toggle_both_overlays_interaction():
+        """
+        ASR_INTERACTION_HOTKEY / INTERACTION_HOTKEY: move both overlays in sync.
+        Uses set_interaction so one key always yields one net state (avoids
+        double-toggle bugs when the same combo was registered twice).
+        """
+        all_interactive = ui_asr.is_interactive and ui_vision.is_interactive
+        new_state = not all_interactive
+        logger.info(
+            "Both overlays → %s (draggable / click-through).",
+            "interactive" if new_state else "click-through",
+        )
+        ui_asr.set_interaction(new_state)
+        ui_vision.set_interaction(new_state)
 
     def on_force_stealth():
         logger.info("Force stealth hotkey triggered (click-through for both overlays).")
         ui_asr.set_interaction(False)
         ui_vision.set_interaction(False)
 
-    def _start_hotkey_pair(primary: str, backup: str, cb, *, label: str):
+    def _start_hotkey_pair(
+        primary: str,
+        backup: str,
+        cb,
+        *,
+        label: str,
+        registered: set[str],
+        trigger_on_release: bool = False,
+    ):
         primary = (primary or "").strip()
         backup = (backup or "").strip()
         hks = []
-        if primary:
+
+        def _add_combo(combo: str) -> None:
+            if not combo:
+                return
+            key = combo.lower()
+            if key in registered:
+                logger.warning(
+                    "Skipping duplicate hotkey %r (%s) — already bound; "
+                    "leave INTERACTION_HOTKEY empty if it matches ASR_INTERACTION_HOTKEY.",
+                    combo,
+                    label,
+                )
+                return
+            registered.add(key)
             hks.append(
-                HotkeyManager(primary, cb, loop, suppress=False, trigger_on_release=True)
+                HotkeyManager(
+                    combo,
+                    cb,
+                    loop,
+                    suppress=False,
+                    trigger_on_release=trigger_on_release,
+                )
             )
-        if backup and backup.lower() != primary.lower():
-            hks.append(
-                HotkeyManager(backup, cb, loop, suppress=False, trigger_on_release=True)
-            )
+
+        _add_combo(primary)
+        if backup.lower() != primary.lower():
+            _add_combo(backup)
         for hk in hks:
             hk.start()
-        if not hks:
+        if not hks and (primary or backup):
+            logger.warning(f"No hotkey registered for {label} (empty or duplicate combos).")
+        elif not hks:
             logger.warning(f"No hotkey configured for {label}")
         return hks
 
@@ -250,46 +285,53 @@ async def run_pipelines(app, loop):
         except Exception:
             pass
         hk_interactions = []
+        registered_hotkeys: set[str] = set()
 
         logger.info(
             "Hotkeys effective: "
             f"SCREENSHOT_HOTKEY={config.SCREENSHOT_HOTKEY!r}, "
-            f"ASR_INTERACTION_HOTKEY={getattr(config, 'ASR_INTERACTION_HOTKEY', '')!r}, "
+            f"ASR_INTERACTION_HOTKEY={getattr(config, 'ASR_INTERACTION_HOTKEY', '')!r} (both overlays), "
             f"VISION_INTERACTION_HOTKEY={getattr(config, 'VISION_INTERACTION_HOTKEY', '')!r}, "
             f"INTERACTION_HOTKEY(all)={getattr(config, 'INTERACTION_HOTKEY', '')!r}"
         )
 
         hk_screenshot = HotkeyManager(config.SCREENSHOT_HOTKEY, on_screenshot, loop, suppress=False)
         hk_screenshot.start()
+        _ss = (config.SCREENSHOT_HOTKEY or "").strip().lower()
+        if _ss:
+            registered_hotkeys.add(_ss)
 
-        # Preferred: separate per-overlay hotkeys
+        # ASR_INTERACTION_* defaults (alt+a): toggles both overlays together (draggable ↔ click-through).
         hk_interactions += _start_hotkey_pair(
             getattr(config, "ASR_INTERACTION_HOTKEY", ""),
             getattr(config, "ASR_INTERACTION_HOTKEY_BACKUP", ""),
-            on_toggle_asr_interaction,
-            label="ASR interaction",
+            on_toggle_both_overlays_interaction,
+            label="Both overlays (ASR_INTERACTION_HOTKEY)",
+            registered=registered_hotkeys,
         )
         hk_interactions += _start_hotkey_pair(
             getattr(config, "VISION_INTERACTION_HOTKEY", ""),
             getattr(config, "VISION_INTERACTION_HOTKEY_BACKUP", ""),
             on_toggle_vision_interaction,
             label="Vision interaction",
+            registered=registered_hotkeys,
         )
 
-        # Backward compatible: one hotkey toggles both overlays (if set)
+        # Optional second binding same as ASR_INTERACTION_* (leave empty to avoid duplicate).
         hk_interactions += _start_hotkey_pair(
             getattr(config, "INTERACTION_HOTKEY", ""),
             getattr(config, "INTERACTION_HOTKEY_BACKUP", ""),
-            on_toggle_all_interaction,
-            label="Global interaction",
+            on_toggle_both_overlays_interaction,
+            label="Global interaction (INTERACTION_HOTKEY)",
+            registered=registered_hotkeys,
         )
 
-        # Force stealth (recommended safety hotkey)
         hk_interactions += _start_hotkey_pair(
             getattr(config, "FORCE_STEALTH_HOTKEY", ""),
             getattr(config, "FORCE_STEALTH_HOTKEY_BACKUP", ""),
             on_force_stealth,
             label="Force stealth",
+            registered=registered_hotkeys,
         )
 
     # Initial hotkeys registration (also supports runtime reloads)
