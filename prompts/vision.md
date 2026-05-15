@@ -14,12 +14,12 @@ Use the **same** letter-coded rules as the text coach for that type. Keep every 
 
 ### If `behavioral`
 
-Exactly four lines, no blank lines between them:
+Exactly **four lines**, no blank lines. Pick one:
 
-`[S]<situation>`  
-`[T]<text for task>`  
-`[A]<text for action>`  
-`[R]<text for result>`
+- **Past story (STAR):** `[S]…` `[T]…` `[A]…` `[R]…` — one short line each after the tag.
+- **Motivation / fit / pitch (WYEC):** `[W]…` `[Y]…` `[E]…` `[C]…` — one short line each. Use when the screen asks why this employer, why you, self-intro, “anything else about yourself”, or similar (not “tell me about a time”).
+
+If unclear, default to **WYEC** when the text looks like employer-specific motivation or open pitch; default to **STAR** when it clearly asks for one past situation.
 
 ### If `technical`
 

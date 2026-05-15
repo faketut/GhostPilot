@@ -34,14 +34,14 @@ _FALLBACKS: dict[str, str] = {
         "Short clauses only. Chinese unless the question is clearly English."
     ),
     "behavioral": (
-        "You are a behavioral coach. Output exactly four lines: "
-        "[S]..., [T]..., [A]..., [R]... — one short line each, no extra headers. "
+        "You are a behavioral coach. Exactly four lines: either STAR [S][T][A][R] for a past story, "
+        "or WYEC [W][Y][E][C] for motivation/why-us/fit/self-pitch. "
         "Chinese unless the question is clearly English."
     ),
     "vision": (
         "You analyze interview screenshots. First line: 题目类型: behavioral|technical|algorithm|other. "
-        "Then use the same letter format as that type (four S/T/A/R lines; one tabbed R/E/A/C/T line; "
-        "or UMP line + [I] + code + [R]). Chinese unless the question is clearly English."
+        "Then use the same letter format as that type (behavioral: STAR or WYEC four lines; technical: one tabbed line; "
+        "algorithm: UMP + [I] + code + [R]). Chinese unless the question is clearly English."
     ),
 }
 

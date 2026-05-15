@@ -29,8 +29,17 @@ logger = logging.getLogger(__name__)
 
 _BEHAVIORAL_KW = [
     "经历", "举例", "讲一个", "描述一次", "给我讲", "冲突", "挑战",
+    "为什么加入", "为什么选择", "为什么想来", "为何应聘", "自我介绍",
+    "动机", "还有什么补充", "对我们公司", "对本公司", "了解我们公司",
     "describe", "tell me about", "conflict", "challenge", "walk me through",
     "give an example", "a time when",
+    # Motivation / fit / open pitch (not episodic STAR)
+    "why do you want", "why us", "why this company", "why our company",
+    "why are you interested", "why join", "what attracts you",
+    "anything else", "like to share about yourself", "strong candidate",
+    "why should we hire", "tell us about yourself", "introduce yourself",
+    "what do you know about us", "cultural fit", "values align",
+    "why this role", "why the role", "what interests you about",
 ]
 _ALGORITHM_KW = [
     "算法", "数组", "链表", "树", "图", "动态规划", "排序", "搜索",
@@ -82,7 +91,7 @@ _CLASSIFIER_SYSTEM = """You classify one interview question.
 Reply with JSON only, no markdown. Schema: {"type":"<one>"} where <one> is exactly one word: behavioral | technical | algorithm.
 
 Definitions:
-- behavioral: soft skills, teamwork, conflict, leadership, "tell me about a time", STAR-style stories.
+- behavioral: soft skills, teamwork, conflict, leadership, STAR-style past stories ("tell me about a time"); ALSO motivation/why-this-company/why-this-role, self-intro, "anything else about yourself", culture/values fit, "why should we hire you" — anything mainly about people, fit, or personal narrative rather than CS theory or coding.
 - technical: CS concepts, system design, frameworks, tools, debugging — not mainly "write this algorithm from scratch".
 - algorithm: coding / DSA / LeetCode style, implementations, complexity, specific algorithm names."""
 
@@ -91,7 +100,7 @@ _VISION_STEP_A_SYSTEM = """You analyze one screenshot from a technical interview
 Reply with JSON only, no markdown. Schema:
 {"visible_question":"<plain text of the main question on screen, or empty string>","type":"behavioral|technical|algorithm"}
 
-Use the same definitions as a text classifier: behavioral = soft/STAR; technical = concepts/design/tools; algorithm = coding/DSA."""
+Use the same definitions as a text classifier: behavioral = soft skills, STAR stories, motivation/why-us/fit/self-intro; technical = concepts/design/tools; algorithm = coding/DSA."""
 
 
 _ENGLISH_SUFFIX = "\n\nOutput language: English. Respond in English only."
