@@ -13,6 +13,4 @@ __pycache__/
 *.pyzwzw
 config.json
 
-knowledge/
-prompts/
-prd.md
+knowledge/*

@@ -1,4 +1,7 @@
 import logging
+import re
+from collections.abc import Callable
+
 import numpy as np
 
 try:
@@ -9,6 +12,16 @@ except Exception as e:
     _ST_IMPORT_ERROR = e
 
 logger = logging.getLogger(__name__)
+
+_KB_HEADER = re.compile(r"^\[kb:([^]#]+)#\d+\]")
+
+
+def kb_relpath_from_chunk(chunk: str) -> str | None:
+    """Return the knowledge file path from a chunk header, or None if missing."""
+    first = (chunk or "").lstrip().split("\n", 1)[0].strip()
+    m = _KB_HEADER.match(first)
+    return m.group(1) if m else None
+
 
 class RAGManager:
     def __init__(self):
@@ -29,7 +42,7 @@ class RAGManager:
                 logger.warning(f"sentence-transformers unavailable (RAG disabled): {err}")
             else:
                 logger.warning("sentence-transformers unavailable (RAG disabled).")
-        
+
     def load_documents(self, texts: list[str]):
         """Vectorizes and loads documents (Resume, JD) into memory."""
         self.documents = texts
@@ -38,25 +51,52 @@ class RAGManager:
             self.embeddings = self.model.encode(self.documents, convert_to_numpy=True)
             # Normalize embeddings for fast cosine similarity
             self.embeddings = self.embeddings / np.linalg.norm(self.embeddings, axis=1, keepdims=True)
-        
-    def search(self, query: str, top_k: int = 3) -> list[str]:
-        """Returns the top_k most similar document fragments."""
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        min_score: float = 0.0,
+        source_filter: Callable[[str], bool] | None = None,
+    ) -> list[str]:
+        """
+        Return up to top_k chunk texts ranked by cosine similarity to the query.
+
+        - min_score: drop hits with similarity strictly below this (0 = no threshold).
+        - source_filter: if set, only chunks whose [kb:rel#n] rel path passes are kept.
+        """
         if not self.documents:
             return []
-            
+
         if self.model and self.embeddings is not None:
             query_emb = self.model.encode([query], convert_to_numpy=True)
-            # Normalize query
             query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
-            
-            # Cosine similarity via dot product (since both are normalized)
+
             similarities = np.dot(self.embeddings, query_emb.T).flatten()
-            
-            # Get top_k indices
-            top_indices = np.argsort(similarities)[-top_k:][::-1]
-            logger.info(f"RAG search matched indices: {top_indices}")
-            return [self.documents[i] for i in top_indices]
-        
-        # RAG disabled → return no context (safe default, avoids hallucinating a random doc)
+            order = np.argsort(similarities)[::-1]
+
+            out: list[str] = []
+            for idx in order:
+                if len(out) >= top_k:
+                    break
+                sim = float(similarities[idx])
+                if sim < min_score:
+                    continue
+                doc = self.documents[int(idx)]
+                if source_filter is not None:
+                    rel = kb_relpath_from_chunk(doc) or ""
+                    if not source_filter(rel):
+                        continue
+                out.append(doc)
+
+            logger.info(
+                "RAG search: %d snippets (min_score=%s, filter=%s)",
+                len(out),
+                min_score,
+                source_filter is not None,
+            )
+            return out
+
         logger.info("RAG disabled; returning no context snippets.")
         return []

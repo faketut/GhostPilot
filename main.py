@@ -7,7 +7,7 @@ from src.windows_api import set_dpi_awareness
 from src.audio_capture import AudioCapture
 from src.asr_client import ASRClient
 from src.rag_manager import RAGManager
-from src.llm_engine import LLMEngine, classify_question
+from src.llm_engine import LLMEngine
 from src.hotkey_manager import HotkeyManager
 from src.config import config
 
@@ -157,6 +157,11 @@ async def run_pipelines(app, loop):
         try:
             # Apply lightweight UI changes immediately
             _apply_overlay_opacity()
+            if ui_asr is not None:
+                ui_asr._max_conversation_blocks = getattr(
+                    config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3
+                )
+                ui_asr._retrim_and_render()
 
             # LLM clients may need recreation (provider/key/model changes)
             llm_engine.reload_clients()
@@ -170,7 +175,14 @@ async def run_pipelines(app, loop):
             logger.error(f"Runtime settings apply failed: {e}")
 
     # Create overlays after we have the callback
-    ui_asr = OverlayUI(title="GhostPilot · ASR", with_tray=True, start_y=20, accent="🎙️ ASR", on_settings_saved=on_settings_saved)
+    ui_asr = OverlayUI(
+        title="GhostPilot · ASR",
+        with_tray=True,
+        start_y=20,
+        accent="🎙️ ASR",
+        on_settings_saved=on_settings_saved,
+        max_conversation_blocks=getattr(config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3),
+    )
     ui_vision = OverlayUI(title="GhostPilot · Vision", with_tray=False, start_y=310, accent="📸 Vision", on_settings_saved=on_settings_saved)
     # Start UI updaters and ASR now that UIs exist
     asr_task = loop.create_task(asr_client.start_streaming(audio_queue, text_queue, loop))
@@ -359,10 +371,12 @@ async def run_pipelines(app, loop):
             question = msg["text"]
             logger.info(f"ASR Finalize (timeout) [{speaker}]: {question}")
             ui_asr.set_status("")
-            q_type = classify_question(question)
+            q_type = await llm_engine.classify_question_llm(question)
             ui_asr.show_thinking(q_type)
             ui_asr.append_block(f"[{speaker}] {question}\nA: ")
-            await llm_engine.generate_answer_stream(question, ui_queue_asr)
+            await llm_engine.generate_answer_stream(
+                question, ui_queue_asr, q_type=q_type
+            )
         except Exception as e:
             logger.error(f"ASR finalize error: {e}")
 
@@ -377,12 +391,13 @@ async def run_pipelines(app, loop):
                     logger.info(f"ASR Final [{speaker}]: {question}")
                     pending_partial = None
                     _cancel_partial_timer()
-                    # Classify immediately so the badge lights up before the first token
-                    q_type = classify_question(question)
+                    q_type = await llm_engine.classify_question_llm(question)
                     ui_asr.set_status("")
                     ui_asr.show_thinking(q_type)
                     ui_asr.append_block(f"[{speaker}] {question}\nA: ")
-                    await llm_engine.generate_answer_stream(question, ui_queue_asr)
+                    await llm_engine.generate_answer_stream(
+                        question, ui_queue_asr, q_type=q_type
+                    )
 
                 elif msg["type"] == "partial":
                     speaker = msg.get("speaker", "Unknown")

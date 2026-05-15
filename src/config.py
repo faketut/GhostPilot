@@ -36,8 +36,14 @@ class Config:
     # ASR segmentation
     ASR_PARTIAL_SILENCE_MS = int(os.getenv("ASR_PARTIAL_SILENCE_MS", "650"))
     ASR_PUNCTUATION_FINALIZE = os.getenv("ASR_PUNCTUATION_FINALIZE", "1") != "0"
+    # ASR overlay: keep only the last N Q&A blocks (split by the same separator as append_block). 0 = unlimited.
+    _asr_max_conv = os.getenv("ASR_OVERLAY_MAX_CONVERSATIONS", "3")
+    try:
+        ASR_OVERLAY_MAX_CONVERSATIONS = int((_asr_max_conv or "3").strip())
+    except ValueError:
+        ASR_OVERLAY_MAX_CONVERSATIONS = 3
 
-    # Vision timeout / safety
+    # Vision timeout / safety (applies to the whole two-step vision pipeline)
     VISION_TIMEOUT_SEC = float(os.getenv("VISION_TIMEOUT_SEC", "8.0"))
 
     # UI Settings
@@ -49,8 +55,27 @@ class Config:
     # Response language preference:
     # - "auto": follow question language (fallback zh)
     # - "zh": always Chinese
-    # - "en": always English
-    RESPONSE_LANGUAGE = os.getenv("RESPONSE_LANGUAGE", "auto")
+    # - "en": always English (default for interview coach output)
+    RESPONSE_LANGUAGE = os.getenv("RESPONSE_LANGUAGE", "en")
+
+    # RAG: minimum cosine similarity (0–1) to keep a chunk; below threshold chunks are dropped
+    _rag_min = os.getenv("RAG_MIN_SCORE", "0.32")
+    try:
+        RAG_MIN_SCORE = float((_rag_min or "0.32").strip())
+    except ValueError:
+        RAG_MIN_SCORE = 0.32
+
+    # LLM question classifier (text model, non-streaming)
+    _cls_max = os.getenv("CLASSIFIER_MAX_TOKENS", "64")
+    try:
+        CLASSIFIER_MAX_TOKENS = int((_cls_max or "64").strip())
+    except ValueError:
+        CLASSIFIER_MAX_TOKENS = 64
+    _cls_temp = os.getenv("CLASSIFIER_TEMPERATURE", "0.1")
+    try:
+        CLASSIFIER_TEMPERATURE = float((_cls_temp or "0.1").strip())
+    except ValueError:
+        CLASSIFIER_TEMPERATURE = 0.1
     
     # Hotkeys
     SCREENSHOT_HOTKEY = os.getenv("SCREENSHOT_HOTKEY", "alt+p")

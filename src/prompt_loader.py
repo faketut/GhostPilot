@@ -23,24 +23,25 @@ _PROMPT_DIR = Path(__file__).parent.parent / "prompts"
 # ── Inline fallbacks (used when .md file is absent) ──────────────────────
 _FALLBACKS: dict[str, str] = {
     "algorithm": (
-        "You are an expert algorithms and data structures interviewer coach. "
-        "For the given problem: identify the pattern, explain the optimal approach, "
-        "provide clean code, and state time/space complexity. Respond in Chinese."
+        "You are an algorithms coach. Output: (1) one line [U][M][P] tight clauses; "
+        "(2) line with [I] then a fenced code block, no comments; "
+        "(3) one line [R] with T(n)/S(n) + sanity. "
+        "Chinese unless the question is clearly English."
     ),
     "technical": (
-        "You are a senior software engineer interview coach. "
-        "Answer the technical concept question with: core definition, key points, "
-        "common pitfalls. ≤150 words."
+        "You are a senior SWE coach. Output exactly ONE line: "
+        "[R]... then TAB, [E]..., [A]..., [C]..., [T]... using real TAB characters. "
+        "Short clauses only. Chinese unless the question is clearly English."
     ),
     "behavioral": (
-        "You are a behavioral interview coach. "
-        "Answer using the STAR framework (Situation, Task, Action, Result). "
-        "≤150 words."
+        "You are a behavioral coach. Output exactly four lines: "
+        "[S]..., [T]..., [A]..., [R]... — one short line each, no extra headers. "
+        "Chinese unless the question is clearly English."
     ),
     "vision": (
-        "You are a technical interview coach. Analyze the screenshot and provide "
-        "a concise solution including approach, code/design, and complexity. "
-        "≤250 words. Respond in Chinese."
+        "You analyze interview screenshots. First line: 题目类型: behavioral|technical|algorithm|other. "
+        "Then use the same letter format as that type (four S/T/A/R lines; one tabbed R/E/A/C/T line; "
+        "or UMP line + [I] + code + [R]). Chinese unless the question is clearly English."
     ),
 }
 

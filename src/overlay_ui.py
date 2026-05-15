@@ -141,6 +141,10 @@ class _DragHeader(QWidget):
 
 
 class OverlayUI(QMainWindow):
+    """`max_conversation_blocks`: trim ASR history to the last N blocks (split on `—` separators). None or 0 = no limit."""
+
+    CONVERSATION_BLOCK_SEP = "\n\n—\n\n"
+
     def __init__(
         self,
         *,
@@ -149,15 +153,18 @@ class OverlayUI(QMainWindow):
         start_y: int = 20,
         accent: str = "● GhostPilot",
         on_settings_saved=None,
+        max_conversation_blocks: int | None = None,
     ):
         super().__init__()
         self.is_interactive = True   # toggled by Alt+A
         self._full_text = ""         # accumulated streamed text
+        self._max_conversation_blocks = max_conversation_blocks
         self._title = title
         self._with_tray = with_tray
         self._start_y = start_y
         self._accent = accent
         self._on_settings_saved = on_settings_saved
+        self._status_flash_timer: QTimer | None = None
         self._initUI()
 
     def _initUI(self):
@@ -250,6 +257,9 @@ class OverlayUI(QMainWindow):
         anim_row.addWidget(self._anim_frame)
         vbox.addLayout(anim_row)
 
+        self._status_flash_timer = QTimer(self)
+        self._status_flash_timer.setSingleShot(True)
+
         # ── System tray (optional) ────────────────────────────────────────
         if self._with_tray:
             self._init_tray()
@@ -287,11 +297,28 @@ class OverlayUI(QMainWindow):
         self._anim_frame.show()
         self._pulse.start()
 
+    def _trim_conversation_blocks(self) -> None:
+        mb = self._max_conversation_blocks
+        if mb is None or mb <= 0 or not self._full_text:
+            return
+        parts = self._full_text.split(self.CONVERSATION_BLOCK_SEP)
+        if len(parts) <= mb:
+            return
+        self._full_text = self.CONVERSATION_BLOCK_SEP.join(parts[-mb:])
+
+    def _retrim_and_render(self) -> None:
+        self._trim_conversation_blocks()
+        html = self._to_html(self._full_text)
+        self._content.setText(html)
+        sb = self._scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def append_block(self, text: str):
         """Append a new block to the overlay (keeps history)."""
         if self._full_text:
-            self._full_text += "\n\n—\n\n"
+            self._full_text += self.CONVERSATION_BLOCK_SEP
         self._full_text += text
+        self._trim_conversation_blocks()
         self.update_text("", append=True)  # re-render current full text
 
     def set_status(self, text: str):
@@ -319,6 +346,7 @@ class OverlayUI(QMainWindow):
             self._full_text = text
         else:
             self._full_text += text
+            self._trim_conversation_blocks()
 
         # Stop thinking animation on first real token
         if self._anim_frame.isVisible() and text:
@@ -370,18 +398,45 @@ class OverlayUI(QMainWindow):
 
         return f'<span style="color:{_TEXT_PRIMARY}">{text}</span>'
 
+    def _flash_bottom_status(self, message: str, duration_ms: int = 1500) -> None:
+        """Brief bottom-line hint without touching `_full_text` (does not interrupt ASR/LLM body)."""
+        timer = self._status_flash_timer
+        if timer is None:
+            return
+        try:
+            timer.timeout.disconnect()
+        except TypeError:
+            pass
+        timer.stop()
+
+        prev_text = self._thinking_label.text()
+        prev_anim_visible = self._anim_frame.isVisible()
+        prev_pulse = self._timer_is_running()
+
+        self._thinking_label.setText(message)
+        self._anim_frame.show()
+        self._pulse.stop()
+
+        def restore():
+            self._thinking_label.setText(prev_text)
+            if prev_anim_visible:
+                self._anim_frame.show()
+                if prev_pulse:
+                    self._pulse.start()
+            else:
+                self._anim_frame.hide()
+                self._pulse.stop()
+
+        timer.timeout.connect(restore)
+        timer.start(duration_ms)
+
     def toggle_interaction(self):
         self.is_interactive = not self.is_interactive
         if sys.platform == "win32":
             set_window_interaction_mode(int(self.winId()), self.is_interactive)
         mode = "🖱️ 可拖拽" if self.is_interactive else "👻 隐身穿透"
         logger.info(f"Interaction mode → {mode}")
-        # Brief status flash
-        self.update_text(
-            f"已切换至 {mode} 模式",
-            append=False,
-        )
-        QTimer.singleShot(1500, lambda: self.update_text(self._full_text or "", append=False))
+        self._flash_bottom_status(f"已切换至 {mode} 模式")
 
     def set_interaction(self, interactive: bool):
         """Force interaction mode (does not toggle)."""
@@ -390,5 +445,4 @@ class OverlayUI(QMainWindow):
             set_window_interaction_mode(int(self.winId()), self.is_interactive)
         mode = "🖱️ 可拖拽" if self.is_interactive else "👻 隐身穿透"
         logger.info(f"Interaction mode → {mode}")
-        self.update_text(f"已切换至 {mode} 模式", append=False)
-        QTimer.singleShot(1500, lambda: self.update_text(self._full_text or "", append=False))
+        self._flash_bottom_status(f"已切换至 {mode} 模式")

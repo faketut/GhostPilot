@@ -74,6 +74,10 @@ All config can be set via:
 - **Safety (force both overlays click-through)**:
   - `FORCE_STEALTH_HOTKEY` / `FORCE_STEALTH_HOTKEY_BACKUP`
 
+### ASR overlay text
+
+- `ASR_OVERLAY_MAX_CONVERSATIONS` (default `3`): trim the ASR overlay body to the last *N* conversation blocks (blocks are separated the same way as between turns in the UI). Set to `0` for unlimited history.
+
 ### Local knowledge base (RAG)
 
 Put your resume/cheatsheets/notes under `knowledge/` (default).
