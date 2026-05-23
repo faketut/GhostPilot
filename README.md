@@ -1,6 +1,17 @@
 # GhostPilot
 
-Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LLM** + **Alt+P screenshot → multimodal LLM**, with a local **RAG knowledge base**.
+Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LLM** + **Alt+P screenshot → multimodal LLM**, with a local **hybrid RAG knowledge base**.
+
+## Features
+
+- Click-through stealth overlays (ASR + Vision) with synced hotkeys.
+- WASAPI loopback capture → Azure Speech streaming → segmenter → text LLM.
+- Alt+P region screenshot → vision LLM (Gemini / OpenAI), independent pipeline.
+- Multi-provider text LLM: **OpenAI · DeepSeek · Ollama (local)** through one OpenAI-compatible adapter; **Gemini** via `google-genai`.
+- Hybrid RAG over `knowledge/` (BM25 + dense embeddings, RRF fused; embeddings load lazily).
+- Multi-turn context (configurable depth), vision screenshot history, prompt preheat.
+- Pricing/usage accounting, crash logger, conversation export, optional session recording.
+- Secrets via OS keyring (with `.env` / `config.json` fallback).
 
 ## Architecture
 
@@ -56,12 +67,26 @@ All config can be set via:
 
 ### Required keys
 
-- **Azure ASR**:
-  - `SPEECH_KEY`
-  - `SPEECH_REGION` (or `ENDPOINT`)
-- **Vision (Gemini)**:
-  - `GEMINI_API_KEY`
-  - `VISION_MODEL=gemini-...`
+- **Azure ASR**: `SPEECH_KEY`, `SPEECH_REGION` (or `ENDPOINT`)
+- **Vision (Gemini default)**: `GEMINI_API_KEY`, `VISION_MODEL=gemini-...`
+- **Text LLM** (pick one): `OPENAI_API_KEY` *or* `DEEPSEEK_API_KEY` *or* a running Ollama server.
+
+### Text LLM providers
+
+Provider is inferred from `TEXT_MODEL` but can be forced via `TEXT_PROVIDER`:
+
+| Provider | `TEXT_PROVIDER` | Example `TEXT_MODEL` | Key |
+| --- | --- | --- | --- |
+| DeepSeek | `deepseek` | `deepseek-chat` | `DEEPSEEK_API_KEY` |
+| OpenAI | `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| Ollama (local) | `ollama` | `llama3.1` / `qwen2.5` / `ollama/<name>` | n/a (`OLLAMA_BASE_URL=http://localhost:11434/v1`) |
+
+Vision provider similarly via `VISION_PROVIDER` (`gemini` / `openai`).
+
+### Multi-turn context & vision history
+
+- `CONTEXT_TURNS` (default `0`) — number of prior (Q, A) pairs fed back to the text model.
+- `VISION_HISTORY` (default `5`) — recent screenshots retained for re-asking.
 
 ### Hotkeys (two overlays)
 
@@ -78,18 +103,20 @@ All config can be set via:
 
 - `ASR_OVERLAY_MAX_CONVERSATIONS` (default `3`): trim the ASR overlay body to the last *N* conversation blocks (blocks are separated the same way as between turns in the UI). Set to `0` for unlimited history.
 
-### Local knowledge base (RAG)
+### Local knowledge base (hybrid RAG)
 
 Put your resume/cheatsheets/notes under `knowledge/` (default).
 
 - `KNOWLEDGE_DIR=knowledge`
 - `KNOWLEDGE_PATTERNS=*.md,*.txt`
+- `KNOWLEDGE_CHUNK_CHARS=900`, `KNOWLEDGE_OVERLAP_CHARS=120`
+- `RAG_MIN_SCORE=0.32` — drop chunks below this cosine similarity.
 
-On startup the app will:
-- read those files
-- chunk them
-- embed + index in memory (if `sentence-transformers` is available)
-- inject top matches into the text LLM prompt
+On startup the app reads + chunks those files and builds:
+- a **BM25** index (via `rank-bm25`) — always available, instant.
+- a **dense embedding** index (via `sentence-transformers`) — loaded lazily on first query if installed.
+
+Both rankings are fused with Reciprocal Rank Fusion and the top matches are injected into the text LLM prompt.
 
 ## Notes / troubleshooting
 
@@ -107,9 +134,16 @@ Open from the system tray (right-click → Settings) or the ⚙️ button on the
 
 Secret fields all have a 👁 show/hide toggle. Most changes apply immediately — no restart needed.
 
+## Session recording & export
+
+- **Export current conversation** from the ASR overlay (writes Markdown to disk).
+- **Session recorder** (opt-in, minimal): when enabled, appends each finalized Q/A to a JSONL file under the user data dir for later review.
+
 ## Security
 
-- API keys are stored in `config.json` (and/or `.env`) as **plain text** on disk. Both files are listed in `.gitignore` — do not commit them.
-- The app never sends keys anywhere except to the configured providers (Azure / OpenAI / DeepSeek / Gemini).
-- Screenshots taken via `Alt+P` are sent to the configured vision model and are not persisted to disk.
+- API keys preferred storage: **OS keyring** (`keyring`). Falls back to `.env` and `config.json` for compatibility.
+- `.env` and `config.json` are in `.gitignore` — never commit them. Plain-text fallback is plain text; treat the files accordingly.
+- The app never sends keys anywhere except to the configured providers (Azure / OpenAI / DeepSeek / Gemini / your local Ollama).
+- Screenshots taken via `Alt+P` are sent to the configured vision model and are not persisted to disk (unless session recording is enabled).
+- Crash logs are written locally under the user data dir; they may contain prompts but never API keys.
 - For best operational hygiene: use a separate API key per machine and rotate periodically.
