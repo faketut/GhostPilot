@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator
 
 
-@dataclass(slots=True)
+@dataclass
 class Usage:
     in_tokens: int = 0
     out_tokens: int = 0
@@ -16,7 +16,7 @@ class Usage:
     cost_usd: float | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class Delta:
     """One chunk from a streaming response.
 

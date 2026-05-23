@@ -12,7 +12,17 @@ Engine code picks a provider per pipeline (text / vision) via
 """
 
 from src.llm.base import LLMProvider, Delta, Usage
-from src.llm.factory import make_text_provider, make_vision_provider
+
+
+def make_text_provider():
+    from src.llm.factory import make_text_provider as _f
+    return _f()
+
+
+def make_vision_provider():
+    from src.llm.factory import make_vision_provider as _f
+    return _f()
+
 
 __all__ = [
     "LLMProvider", "Delta", "Usage",
