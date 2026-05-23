@@ -126,6 +126,7 @@ class _DragHeader(QWidget):
         on_copy,
         on_toggle_interaction,
         on_stop=None,
+        on_export=None,
     ):
         super().__init__(parent_window)
         self._win = parent_window
@@ -159,10 +160,12 @@ class _DragHeader(QWidget):
         self._stop_btn.setVisible(False)
         self._clear_btn = _tb("🧹", "Clear", on_clear)
         self._copy_btn = _tb("📋", "Copy last answer", on_copy)
+        self._export_btn = _tb("💾", "Export conversation to ~/Documents/GhostPilot", on_export or (lambda: None))
         layout.addWidget(self._lock_btn)
         layout.addWidget(self._stop_btn)
         layout.addWidget(self._clear_btn)
         layout.addWidget(self._copy_btn)
+        layout.addWidget(self._export_btn)
 
         self.setFixedHeight(26)
         self._apply_style()
@@ -177,7 +180,7 @@ class _DragHeader(QWidget):
             f"border: 0; font-size: 12px; }} "
             f"QToolButton:hover {{ color: {pal['text_primary']}; }}"
         )
-        for b in (self._lock_btn, self._stop_btn, self._clear_btn, self._copy_btn):
+        for b in (self._lock_btn, self._stop_btn, self._clear_btn, self._copy_btn, self._export_btn):
             b.setStyleSheet(btn_css)
         self.setStyleSheet(
             f"background: {pal['bg_header']}; border-bottom: 1px solid {pal['border']};"
@@ -370,6 +373,7 @@ class OverlayUI(QMainWindow):
             on_copy=self.copy_last_block,
             on_toggle_interaction=self.toggle_interaction,
             on_stop=self._handle_stop,
+            on_export=self.export_conversation,
         )
         self._header._badge.setText(self._accent)
         vbox.addWidget(self._header)
@@ -572,6 +576,26 @@ class OverlayUI(QMainWindow):
             self._flash_bottom_status("Copied ✓", duration_ms=1200)
         except Exception as e:
             logger.warning(f"Clipboard copy failed: {e}")
+
+    def export_conversation(self) -> None:
+        """Save the visible Q/A history to a timestamped markdown file."""
+        if not self._full_text.strip():
+            self._flash_bottom_status("Nothing to export", duration_ms=1500)
+            return
+        import datetime
+        from pathlib import Path
+        out_dir = Path.home() / "Documents" / "GhostPilot"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = out_dir / f"session-{stamp}.md"
+            header = f"# GhostPilot session — {stamp}\n\nWindow: {self._title}\n\n---\n\n"
+            path.write_text(header + self._full_text, encoding="utf-8")
+            self._flash_bottom_status(f"Saved ✓ {path.name}", duration_ms=2500)
+            logger.info("Exported conversation to %s", path)
+        except Exception as e:
+            logger.warning("Export failed: %s", e)
+            self._flash_bottom_status(f"Export failed: {e}", duration_ms=2500)
 
     def set_status(self, text: str):
         """Show a lightweight status line without overwriting main content."""
