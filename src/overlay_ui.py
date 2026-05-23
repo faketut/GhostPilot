@@ -488,10 +488,26 @@ class OverlayUI(QMainWindow):
         menu = QMenu()
         menu.addAction("⚙️ Settings", self._open_settings)
         menu.addSeparator()
+        self._record_action = menu.addAction("🔴 Start recording", self._toggle_recording)
+        menu.addSeparator()
         menu.addAction("❌ Quit", QApplication.instance().quit)
         tray.setContextMenu(menu)
         tray.show()
         self._tray = tray
+
+    def _toggle_recording(self):
+        from src.session_recorder import recorder
+        if recorder.is_recording():
+            out = recorder.stop()
+            self._record_action.setText("🔴 Start recording")
+            self._flash_bottom_status(f"Recording saved: {out.name if out else '?'}", duration_ms=2500)
+        else:
+            d = recorder.start()
+            if d:
+                self._record_action.setText("⏹ Stop recording")
+                self._flash_bottom_status("● Recording…", duration_ms=1500)
+            else:
+                self._flash_bottom_status("Recording failed to start", duration_ms=2000)
 
     def _open_settings(self):
         dlg = SettingsUI(self, on_saved=self._on_settings_saved)

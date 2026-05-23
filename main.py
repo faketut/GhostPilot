@@ -57,6 +57,11 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
                     if cs:
                         parts.append(cs)
                     ui.set_usage_footer(" · ".join(parts))
+                    # Session recorder (Phase 5.4)
+                    from src.session_recorder import recorder as _rec
+                    _rec.log_llm("assistant", "", tokens_in=msg.get("in", 0),
+                                 tokens_out=msg.get("out", 0), cost_usd=c,
+                                 model=msg.get("model", ""))
                 except Exception:
                     pass
         except asyncio.CancelledError:
@@ -459,6 +464,8 @@ async def run_pipelines(app, loop):
                     speaker = msg.get("speaker", "Unknown")
                     question = msg["text"]
                     logger.info(f"ASR Final [{speaker}]: {question}")
+                    from src.session_recorder import recorder as _rec
+                    _rec.log_transcript("final", f"[{speaker}] {question}")
                     pending_partial = None
                     _cancel_partial_timer()
                     q_type = await llm_engine.classify_question_llm(question)
