@@ -35,13 +35,17 @@ def make_text_provider() -> LLMProvider:
     provider = (getattr(config, "TEXT_PROVIDER", "") or "").strip().lower()
     model = config.TEXT_MODEL or ""
 
-    if provider == "ollama" or _is_ollama_model(model):
+    # Explicit provider always wins; model-name inference only kicks in when
+    # provider is left blank (auto).
+    if provider == "openai":
+        return OpenAICompatProvider(api_key=config.OPENAI_API_KEY, label="openai")
+    if provider == "ollama" or (not provider and _is_ollama_model(model)):
         return OpenAICompatProvider(api_key="ollama", base_url=_ollama_base(), label="ollama")
-    if provider == "deepseek" or _is_deepseek(model):
+    if provider == "deepseek" or (not provider and _is_deepseek(model)):
         return OpenAICompatProvider(
             api_key=config.DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1", label="deepseek",
         )
-    if provider == "gemini" or _is_gemini(model):
+    if provider == "gemini" or (not provider and _is_gemini(model)):
         return GeminiProvider(api_key=config.GEMINI_API_KEY)
     # Default → OpenAI
     return OpenAICompatProvider(api_key=config.OPENAI_API_KEY, label="openai")
@@ -51,9 +55,11 @@ def make_vision_provider() -> LLMProvider:
     provider = (getattr(config, "VISION_PROVIDER", "") or "").strip().lower()
     model = config.VISION_MODEL or ""
 
-    if provider == "gemini" or _is_gemini(model):
+    if provider == "openai":
+        return OpenAICompatProvider(api_key=config.OPENAI_API_KEY, label="openai-vision")
+    if provider == "gemini" or (not provider and _is_gemini(model)):
         return GeminiProvider(api_key=config.GEMINI_API_KEY)
-    if _is_deepseek(model):
+    if not provider and _is_deepseek(model):
         # DeepSeek vision: not supported; raise at first use via engine.
         # Still return a placeholder so construction succeeds.
         return OpenAICompatProvider(api_key=config.DEEPSEEK_API_KEY, label="deepseek-vision-unsupported")
