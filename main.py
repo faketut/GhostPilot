@@ -11,6 +11,34 @@ from src.hotkey_manager import HotkeyManager
 from src.config import config
 from src import crash_logger
 
+
+def _make_asr_client():
+    """Build the ASR client according to ``config.ASR_BACKEND``.
+
+    Always returns something duck-typed compatible with ``ASRClient``
+    (``start_streaming``/``stop``) so callers don't branch.
+    """
+    backend = (getattr(config, "ASR_BACKEND", "azure") or "azure").strip().lower()
+    if backend == "whisper":
+        try:
+            from src.whisper_asr import FasterWhisperASRClient
+            return FasterWhisperASRClient(
+                model_name=getattr(config, "WHISPER_MODEL", "small"),
+                device=getattr(config, "WHISPER_DEVICE", "auto"),
+                compute_type=getattr(config, "WHISPER_COMPUTE_TYPE", "int8"),
+                language=(getattr(config, "ASR_LANGUAGE", "en-US") or "").split("-")[0] or None,
+                window_sec=getattr(config, "WHISPER_WINDOW_SEC", 2.5),
+            )
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"Whisper backend requested but unavailable ({e}); falling back to Azure."
+            )
+    return ASRClient(
+        config.AZURE_SPEECH_KEY,
+        config.AZURE_SPEECH_REGION,
+        config.AZURE_SPEECH_ENDPOINT,
+    )
+
 # Defer audio_capture import (pyaudiowpatch is Windows-only); on macOS/Linux
 # devs can still run UI / RAG / prompts iteration without the audio pipeline.
 try:
@@ -89,11 +117,7 @@ async def run_pipelines(app, loop):
             "ASR/audio pipeline is disabled; UI and Vision still work. Reason: %s",
             sys.platform, _AUDIO_IMPORT_ERROR,
         )
-    asr_client = ASRClient(
-        config.AZURE_SPEECH_KEY,
-        config.AZURE_SPEECH_REGION,
-        config.AZURE_SPEECH_ENDPOINT,
-    )
+    asr_client = _make_asr_client()
     rag_manager = RAGManager()
     # ── Load local knowledge base into RAG (resume / cheatsheets / notes) ──
     try:
@@ -176,13 +200,9 @@ async def run_pipelines(app, loop):
             pass
         if asr_task is not None and not asr_task.done():
             asr_task.cancel()
-        # Recreate client to pick up new keys/region/endpoint/language
+        # Recreate client to pick up new keys/region/endpoint/language/backend
         try:
-            asr_client = ASRClient(
-                config.AZURE_SPEECH_KEY,
-                config.AZURE_SPEECH_REGION,
-                config.AZURE_SPEECH_ENDPOINT,
-            )
+            asr_client = _make_asr_client()
         except Exception as e:
             logger.error(f"Failed to recreate ASR client: {e}")
             return

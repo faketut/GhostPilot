@@ -54,6 +54,15 @@ class Config:
     # ASR recognition language. zh-CN for Chinese, en-US for English, etc.
     ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "en-US")
 
+    # ASR backend: "azure" (cloud, default) or "whisper" (local via faster-whisper).
+    ASR_BACKEND = os.getenv("ASR_BACKEND", "azure").strip().lower()
+    # faster-whisper knobs (only used when ASR_BACKEND=whisper).
+    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+    WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")  # auto | cpu | cuda
+    WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+    # How many seconds of audio to buffer before each whisper inference pass.
+    WHISPER_WINDOW_SEC = _env_float("WHISPER_WINDOW_SEC", 2.5)
+
     # LLM Settings
     # Text: DeepSeek-V3 (fast, cheap, great for technical Q&A)
     TEXT_MODEL = os.getenv("TEXT_MODEL", "deepseek-chat")  # deepseek-chat = DeepSeek-V3
