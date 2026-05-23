@@ -137,6 +137,26 @@ class LLMEngine:
         """Drop multi-turn conversation history (called from UI Clear button)."""
         self._text_history.clear()
 
+    async def preheat(self) -> None:
+        """Fire-and-forget tiny request to warm the HTTPS pool. Throttled to once
+        per 60s. Errors are swallowed."""
+        import time
+        now = time.monotonic()
+        last = getattr(self, "_last_preheat", 0.0)
+        if now - last < 60:
+            return
+        self._last_preheat = now
+        try:
+            await self.text_provider.chat_complete(
+                [{"role": "user", "content": "ping"}],
+                model=config.TEXT_MODEL,
+                max_tokens=1,
+                temperature=0.0,
+            )
+            logger.info("Preheat OK (%s).", config.TEXT_MODEL)
+        except Exception as e:
+            logger.info("Preheat skipped: %s", e)
+
     def register_task(self, kind: str, task: asyncio.Task) -> None:
         """Register a running stream task under 'text' | 'vision' so it can be cancelled."""
         prev = self._active_tasks.get(kind)

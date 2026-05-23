@@ -110,6 +110,12 @@ async def run_pipelines(app, loop):
     except Exception as e:
         logger.warning(f"Failed to load local knowledge base (RAG): {e}")
     llm_engine = LLMEngine(rag_manager)
+    # Preheat the LLM connection in the background so the first real request
+    # doesn't pay the cold-start cost (Phase 2.4).
+    try:
+        loop.create_task(llm_engine.preheat())
+    except Exception:
+        pass
 
     # ── Queues ────────────────────────────────────────────────────────────
     audio_queue: asyncio.Queue = asyncio.Queue()
@@ -193,6 +199,11 @@ async def run_pipelines(app, loop):
 
             # LLM clients may need recreation (provider/key/model changes)
             llm_engine.reload_clients()
+            # Preheat after a key/model change.
+            try:
+                loop.create_task(llm_engine.preheat())
+            except Exception:
+                pass
 
             # Hotkeys are registered once → rebuild to apply new bindings
             _rebuild_hotkeys()
