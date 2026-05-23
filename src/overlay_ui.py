@@ -4,44 +4,67 @@ Overlay UI Module
 A glassmorphism-style, frameless, transparent overlay window that:
   - Is invisible to screen capture (WDA_EXCLUDEFROMCAPTURE)
   - Starts in click-through (stealth) mode, toggled by Alt+A
-  - Renders streamed LLM tokens with Markdown-aware formatting
+  - Renders streamed LLM tokens with Markdown-aware formatting into a
+    QTextBrowser (delta-append → smooth streaming, no per-token re-render)
   - Shows a "thinking" pulse animation while the LLM is generating
-  - Has a thin drag-handle header for repositioning
+  - Has a thin drag-handle header with state/clear/copy controls
   - Displays question type badge (🎯 behavioral / 💻 algorithm / 📖 technical)
+  - Persists per-overlay geometry across sessions, clamped to the visible screen
+  - Optional Windows 11 Mica/Acrylic backdrop (silent no-op elsewhere)
 """
 
+import json
+import os
+import re
 import sys
 import logging
+from typing import Optional
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QScrollArea, QSystemTrayIcon, QMenu, QFrame,
+    QLabel, QSystemTrayIcon, QMenu, QTextBrowser, QToolButton, QSizeGrip,
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
-from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QPainter, QBrush, QPen
+from PyQt6.QtGui import (
+    QFont, QColor, QIcon, QPixmap, QPainter, QBrush, QGuiApplication, QTextCursor,
+)
 
-from src.windows_api import enable_window_stealth, set_window_interaction_mode
+from src.windows_api import enable_window_stealth, set_window_interaction_mode, enable_mica
 from src.config import config
 from src.settings_ui import SettingsUI
+from src import theme
 
 logger = logging.getLogger(__name__)
 
-# ── Colour palette (matches OpenGhostPilot dark glass aesthetic) ──────────────
-_BG_GLASS = "rgba(15, 15, 20, 210)"
-_BG_HEADER = "rgba(30, 30, 45, 230)"
-_BORDER = "rgba(255, 255, 255, 40)"
-_TEXT_PRIMARY = "#e8eaf6"
-_TEXT_DIM = "#90939e"
-_ACCENT_GREEN = "#4caf50"
-_ACCENT_BLUE = "#89b4fa"
-_ACCENT_AMBER = "#f9a825"
+# Pygments is optional. Without it we fall back to a plain <pre> code block.
+try:
+    from pygments import highlight as _pyg_highlight
+    from pygments.lexers import get_lexer_by_name as _pyg_get_lexer
+    from pygments.util import ClassNotFound as _PygClassNotFound
+    from pygments.formatters import HtmlFormatter as _PygHtmlFormatter
+    _PYG_FORMATTER = _PygHtmlFormatter(noclasses=True, nowrap=False, style="monokai")
+    HAS_PYGMENTS = True
+except Exception:
+    HAS_PYGMENTS = False
 
-# Badge colours per question type
+# Precompiled Markdown regexes (perf — issue #16)
+_RE_FENCE = re.compile(r"```(\w*)\n([\s\S]*?)```")
+_RE_INLINE = re.compile(r"`([^`]+)`")
+_RE_BOLD = re.compile(r"\*\*(.+?)\*\*")
+
+CONFIG_FILE = "config.json"
+_GEOMETRY_SAVE_DEBOUNCE_MS = 500
+_STICKY_BOTTOM_TOLERANCE_PX = 4
+
+
+# Badge colours per question type (label + base hex; alpha applied at runtime)
 _BADGE = {
-    "behavioral": ("#d97706", "🎯 行为"),
-    "algorithm":  ("#2563eb", "💻 算法"),
-    "technical":  ("#7c3aed", "📖 技术"),
-    "vision":     ("#065f46", "📸 视觉"),
+    "behavioral": ("#d97706", "🎯 Behavioral"),
+    "algorithm":  ("#2563eb", "💻 Algorithm"),
+    "technical":  ("#7c3aed", "📖 Technical"),
+    "vision":     ("#065f46", "📸 Vision"),
 }
+
 
 def _clamp01(x: float) -> float:
     try:
@@ -69,17 +92,21 @@ class _PulseDot(QWidget):
         self._timer.stop()
         self.hide()
 
+    def is_running(self) -> bool:
+        return self._timer.isActive()
+
     def _tick(self):
         self._phase = (self._phase + 1) % 6
         self.update()
 
     def paintEvent(self, _):
+        pal = theme.palette()
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         for i in range(3):
             active = (i == self._phase % 3)
             radius = 5 if active else 3
-            colour = QColor(_ACCENT_GREEN) if active else QColor(100, 100, 100)
+            colour = QColor(pal["accent_green"]) if active else QColor(100, 100, 100)
             p.setBrush(QBrush(colour))
             p.setPen(Qt.PenStyle.NoPen)
             cx = 6 + i * 14
@@ -88,33 +115,80 @@ class _PulseDot(QWidget):
 
 
 class _DragHeader(QWidget):
-    """Thin drag-handle bar at the top of the overlay."""
+    """Thin drag-handle bar at the top of the overlay, with controls cluster."""
 
-    def __init__(self, parent_window: QMainWindow):
+    def __init__(
+        self,
+        parent_window: QMainWindow,
+        *,
+        on_clear,
+        on_copy,
+        on_toggle_interaction,
+    ):
         super().__init__(parent_window)
         self._win = parent_window
-        self._drag_pos: QPoint | None = None
+        self._drag_pos: Optional[QPoint] = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 0)
         layout.setSpacing(6)
 
         self._badge = QLabel("● GhostPilot")
-        self._badge.setStyleSheet(f"color: {_ACCENT_GREEN}; font-size: 11px; font-weight: 600;")
         layout.addWidget(self._badge)
         layout.addStretch()
 
         self._type_badge = QLabel("")
-        self._type_badge.setStyleSheet(
-            "border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: bold;"
-        )
         self._type_badge.hide()
         layout.addWidget(self._type_badge)
 
+        def _tb(text: str, tip: str, slot) -> QToolButton:
+            b = QToolButton(self)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedSize(22, 22)
+            b.clicked.connect(slot)
+            return b
+
+        # Header controls: lock state · clear · copy
+        self._lock_btn = _tb("👻", "Click-through (Alt+A to toggle)", on_toggle_interaction)
+        self._clear_btn = _tb("🧹", "Clear", on_clear)
+        self._copy_btn = _tb("📋", "Copy last answer", on_copy)
+        layout.addWidget(self._lock_btn)
+        layout.addWidget(self._clear_btn)
+        layout.addWidget(self._copy_btn)
+
         self.setFixedHeight(26)
-        self.setStyleSheet(
-            f"background: {_BG_HEADER}; border-bottom: 1px solid {_BORDER};"
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        pal = theme.palette()
+        self._badge.setStyleSheet(
+            f"color: {pal['accent_green']}; font-size: 11px; font-weight: 600;"
         )
+        btn_css = (
+            f"QToolButton {{ color: {pal['text_dim']}; background: transparent; "
+            f"border: 0; font-size: 12px; }} "
+            f"QToolButton:hover {{ color: {pal['text_primary']}; }}"
+        )
+        for b in (self._lock_btn, self._clear_btn, self._copy_btn):
+            b.setStyleSheet(btn_css)
+        self.setStyleSheet(
+            f"background: {pal['bg_header']}; border-bottom: 1px solid {pal['border']};"
+        )
+
+    def refresh_theme(self) -> None:
+        self._apply_style()
+        # Re-apply type badge colour with current style scaffold (badge has its own colour)
+
+    def set_lock_state(self, interactive: bool) -> None:
+        if interactive:
+            self._lock_btn.setText("🖱️")
+            self._lock_btn.setToolTip("Interactive (Alt+A to lock)")
+        else:
+            self._lock_btn.setText("👻")
+            self._lock_btn.setToolTip("Click-through (Alt+A to toggle)")
 
     def set_question_type(self, q_type: str):
         colour, label = _BADGE.get(q_type, ("#555", q_type))
@@ -140,6 +214,46 @@ class _DragHeader(QWidget):
         self._drag_pos = None
 
 
+def _read_config_json() -> dict:
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to read {CONFIG_FILE}: {e}")
+        return {}
+
+
+def _write_config_json(updates: dict) -> None:
+    data = _read_config_json()
+    data.update(updates)
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Failed to save geometry to {CONFIG_FILE}: {e}")
+
+
+def _clamp_geometry(geom: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x, y, w, h = geom
+    screens = QGuiApplication.screens()
+    if not screens:
+        return geom
+    # Pick the screen the saved top-left falls in, or the primary.
+    target = QGuiApplication.primaryScreen()
+    for s in screens:
+        if s.availableGeometry().contains(QPoint(x, y)):
+            target = s
+            break
+    avail = target.availableGeometry()
+    w = max(320, min(int(w), avail.width()))
+    h = max(80, min(int(h), avail.height()))
+    x = max(avail.left(), min(int(x), avail.right() - w))
+    y = max(avail.top(), min(int(y), avail.bottom() - h))
+    return x, y, w, h
+
+
 class OverlayUI(QMainWindow):
     """`max_conversation_blocks`: trim ASR history to the last N blocks (split on `—` separators). None or 0 = no limit."""
 
@@ -154,98 +268,122 @@ class OverlayUI(QMainWindow):
         accent: str = "● GhostPilot",
         on_settings_saved=None,
         max_conversation_blocks: int | None = None,
+        geometry_key: str = "OVERLAY_ASR_GEOMETRY",
+        hotkey_hint: str | None = None,
     ):
         super().__init__()
         self.is_interactive = True   # toggled by Alt+A
-        self._full_text = ""         # accumulated streamed text
+        self._full_text = ""         # accumulated streamed text (history)
         self._max_conversation_blocks = max_conversation_blocks
         self._title = title
         self._with_tray = with_tray
         self._start_y = start_y
         self._accent = accent
         self._on_settings_saved = on_settings_saved
-        self._status_flash_timer: QTimer | None = None
+        self._geometry_key = geometry_key
+        self._hotkey_hint = hotkey_hint
+        self._status_flash_timer: Optional[QTimer] = None
+        self._geom_save_timer: Optional[QTimer] = None
         self._initUI()
+        theme.on_changed(self._on_theme_changed)
+
+    # ── Init / styling ───────────────────────────────────────────────────
+
+    def _apply_root_style(self) -> None:
+        pal = theme.palette()
+        self.centralWidget().setStyleSheet(f"""
+            QWidget#root {{
+                background: {pal['bg_glass']};
+                border: 1px solid {pal['border']};
+                border-radius: 10px;
+            }}
+        """)
+        self._content.setStyleSheet(f"""
+            QTextBrowser {{
+                color: {pal['text_primary']};
+                font-family: 'Segoe UI', 'PingFang SC', sans-serif;
+                font-size: 13px;
+                background: transparent;
+                border: 0;
+                padding: 10px 14px;
+            }}
+            QScrollBar:vertical {{ width: 8px; background: transparent; }}
+            QScrollBar::handle:vertical {{
+                background: {pal['border']};
+                border-radius: 4px;
+                min-height: 24px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """)
+        self._thinking_label.setStyleSheet(f"color: {pal['text_dim']}; font-size: 11px;")
+        self._footer.setStyleSheet(f"color: {pal['footer_text']}; font-size: 10px; padding: 0 12px 4px 12px;")
+
+    def _on_theme_changed(self) -> None:
+        self._apply_root_style()
+        self._header.refresh_theme()
+        # Re-render existing body so colour-bearing inline HTML matches the new theme.
+        self._rerender_full()
 
     def _initUI(self):
-        # ── Window flags ─────────────────────────────────────────────────
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setMinimumSize(QSize(480, 80))
+        self.setMinimumSize(QSize(360, 80))
         self.resize(640, 260)
 
-        # ── Config-driven opacity ─────────────────────────────────────────
-        # Note: this affects the entire window (including text). Keep defaults
-        # conservative; background glass already uses alpha in CSS.
         self.setWindowOpacity(_clamp01(getattr(config, "OVERLAY_OPACITY", 1.0)))
 
-        # ── OS-level stealth (invisible to screen capture) ────────────────
+        # OS-level stealth & native backdrop (Windows only)
         if sys.platform == "win32":
             self.show()
             hwnd = int(self.winId())
             enable_window_stealth(hwnd)
-            # Default: click-through stealth
+            enable_mica(hwnd, acrylic=True)
             self.is_interactive = False
             set_window_interaction_mode(hwnd, False)
 
-        # ── Root widget with glass background ─────────────────────────────
         root = QWidget()
         root.setObjectName("root")
-        root.setStyleSheet(f"""
-            QWidget#root {{
-                background: {_BG_GLASS};
-                border: 1px solid {_BORDER};
-                border-radius: 10px;
-            }}
-        """)
         self.setCentralWidget(root)
 
         vbox = QVBoxLayout(root)
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(0)
 
-        # ── Drag header ───────────────────────────────────────────────────
-        self._header = _DragHeader(self)
+        # Header
+        self._header = _DragHeader(
+            self,
+            on_clear=self.clear,
+            on_copy=self.copy_last_block,
+            on_toggle_interaction=self.toggle_interaction,
+        )
         self._header._badge.setText(self._accent)
         vbox.addWidget(self._header)
 
-        # ── Scroll area for streamed text ──────────────────────────────────
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet("background: transparent;")
-
-        self._content = QLabel()
-        self._content.setWordWrap(True)
-        self._content.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._content.setTextFormat(Qt.TextFormat.RichText)
-        self._content.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self._content.setStyleSheet(f"""
-            color: {_TEXT_PRIMARY};
-            font-family: 'Segoe UI', 'PingFang SC', sans-serif;
-            font-size: 13px;
-            line-height: 1.6;
-            padding: 10px 14px;
-            background: transparent;
-        """)
-        self._content.setText(
-            f'<span style="color:{_TEXT_DIM}; font-style:italic;">GhostPilot 就绪 · 等待问题…</span>'
+        # Streamed-text widget (issue #16): QTextBrowser + delta append.
+        self._content = QTextBrowser()
+        self._content.setReadOnly(True)
+        self._content.setOpenExternalLinks(False)
+        self._content.setFrameShape(QTextBrowser.Shape.NoFrame)
+        self._content.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._content.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._content.setStyleSheet("background: transparent;")
+        # Placeholder
+        pal = theme.palette()
+        self._content.setHtml(
+            f'<span style="color:{pal["text_dim"]}; font-style:italic;">'
+            f'GhostPilot ready · waiting for question…</span>'
         )
-        self._scroll.setWidget(self._content)
-        vbox.addWidget(self._scroll, 1)
+        vbox.addWidget(self._content, 1)
 
-        # ── Thinking animation ────────────────────────────────────────────
+        # Thinking animation row
         anim_row = QHBoxLayout()
         anim_row.setContentsMargins(12, 4, 12, 6)
         self._pulse = _PulseDot()
-        self._thinking_label = QLabel("思考中")
-        self._thinking_label.setStyleSheet(f"color: {_TEXT_DIM}; font-size: 11px;")
+        self._thinking_label = QLabel("Thinking…")
         self._anim_frame = QWidget()
         inner = QHBoxLayout(self._anim_frame)
         inner.setContentsMargins(0, 0, 0, 0)
@@ -257,17 +395,63 @@ class OverlayUI(QMainWindow):
         anim_row.addWidget(self._anim_frame)
         vbox.addLayout(anim_row)
 
+        # Persistent hotkey footer + size grip (issues #25, #26)
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(0, 0, 0, 0)
+        footer_row.setSpacing(0)
+        self._footer = QLabel(self._build_footer_text())
+        footer_row.addWidget(self._footer, 1)
+        grip = QSizeGrip(root)
+        grip.setFixedSize(14, 14)
+        footer_row.addWidget(grip, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+        vbox.addLayout(footer_row)
+
+        self._apply_root_style()
+
         self._status_flash_timer = QTimer(self)
         self._status_flash_timer.setSingleShot(True)
 
-        # ── System tray (optional) ────────────────────────────────────────
+        # Debounced geometry save
+        self._geom_save_timer = QTimer(self)
+        self._geom_save_timer.setSingleShot(True)
+        self._geom_save_timer.setInterval(_GEOMETRY_SAVE_DEBOUNCE_MS)
+        self._geom_save_timer.timeout.connect(self._save_geometry)
+
+        # System tray
         if self._with_tray:
             self._init_tray()
 
-        # Position top-right
-        screen = QApplication.primaryScreen().geometry()
+        # Initial geometry: load saved (clamped) or use sensible default top-right.
         self.setWindowTitle(self._title)
-        self.move(screen.width() - self.width() - 20, self._start_y)
+        self._apply_initial_geometry()
+        self._header.set_lock_state(self.is_interactive)
+
+    def _build_footer_text(self) -> str:
+        bits = [
+            f"{config.SCREENSHOT_HOTKEY} screenshot",
+            f"{getattr(config, 'ASR_INTERACTION_HOTKEY', 'alt+a')} drag",
+            f"{getattr(config, 'FORCE_STEALTH_HOTKEY', 'alt+s')} stealth",
+        ]
+        if self._hotkey_hint:
+            bits.insert(0, self._hotkey_hint)
+        return "  ·  ".join(bits)
+
+    def refresh_footer(self) -> None:
+        self._footer.setText(self._build_footer_text())
+
+    def _apply_initial_geometry(self) -> None:
+        saved = getattr(config, self._geometry_key, None)
+        if saved and isinstance(saved, (list, tuple)) and len(saved) == 4:
+            try:
+                x, y, w, h = _clamp_geometry(tuple(int(v) for v in saved))  # type: ignore[arg-type]
+                self.setGeometry(x, y, w, h)
+                return
+            except Exception as e:
+                logger.warning(f"Bad saved geometry {saved!r}: {e}")
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(screen.right() - self.width() - 20, screen.top() + self._start_y)
+
+    # ── Tray / settings ──────────────────────────────────────────────────
 
     def _init_tray(self):
         px = QPixmap(32, 32)
@@ -275,9 +459,9 @@ class OverlayUI(QMainWindow):
         tray = QSystemTrayIcon(QIcon(px), self)
         tray.setToolTip("GhostPilot Copilot")
         menu = QMenu()
-        menu.addAction("⚙️ 设置", self._open_settings)
+        menu.addAction("⚙️ Settings", self._open_settings)
         menu.addSeparator()
-        menu.addAction("❌ 退出", QApplication.instance().quit)
+        menu.addAction("❌ Quit", QApplication.instance().quit)
         tray.setContextMenu(menu)
         tray.show()
         self._tray = tray
@@ -289,117 +473,166 @@ class OverlayUI(QMainWindow):
     # ── Public API ────────────────────────────────────────────────────────
 
     def show_thinking(self, q_type: str = ""):
-        """Called when a final ASR transcript arrives and LLM has been invoked."""
-        # Default behaviour keeps compatibility; caller can preserve history by not clearing via update_text.
         self._full_text = self._full_text or ""
         if q_type:
             self._header.set_question_type(q_type)
         self._anim_frame.show()
         self._pulse.start()
 
-    def _trim_conversation_blocks(self) -> None:
+    def _trim_conversation_blocks(self) -> bool:
+        """Return True if any blocks were trimmed (means the body must be re-rendered)."""
         mb = self._max_conversation_blocks
         if mb is None or mb <= 0 or not self._full_text:
-            return
+            return False
         parts = self._full_text.split(self.CONVERSATION_BLOCK_SEP)
         if len(parts) <= mb:
-            return
+            return False
         self._full_text = self.CONVERSATION_BLOCK_SEP.join(parts[-mb:])
+        return True
 
     def _retrim_and_render(self) -> None:
         self._trim_conversation_blocks()
+        self._rerender_full()
+
+    def _rerender_full(self) -> None:
         html = self._to_html(self._full_text)
-        self._content.setText(html)
-        sb = self._scroll.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self._content.setHtml(html)
+        self._schedule_scroll_to_bottom()
 
     def append_block(self, text: str):
-        """Append a new block to the overlay (keeps history)."""
+        """Append a new conversation block (keeps history)."""
         if self._full_text:
             self._full_text += self.CONVERSATION_BLOCK_SEP
         self._full_text += text
-        self._trim_conversation_blocks()
-        self.update_text("", append=True)  # re-render current full text
+        trimmed = self._trim_conversation_blocks()
+        if trimmed:
+            self._rerender_full()
+        else:
+            # Append only the new content's HTML.
+            self._append_delta_html(self.CONVERSATION_BLOCK_SEP + text if self._full_text != text else text)
+
+    def clear(self):
+        """Empty the body but keep state/thinking indicator intact."""
+        self._full_text = ""
+        self._content.clear()
+        self._header.clear_badge()
+
+    def copy_last_block(self):
+        """Copy the most recent Q/A block to the clipboard."""
+        if not self._full_text:
+            self._flash_bottom_status("Nothing to copy", duration_ms=1200)
+            return
+        last = self._full_text.split(self.CONVERSATION_BLOCK_SEP)[-1]
+        try:
+            QGuiApplication.clipboard().setText(last)
+            self._flash_bottom_status("Copied ✓", duration_ms=1200)
+        except Exception as e:
+            logger.warning(f"Clipboard copy failed: {e}")
 
     def set_status(self, text: str):
         """Show a lightweight status line without overwriting main content."""
-        # Reuse thinking label area to avoid new layout complexity.
         if text:
             self._thinking_label.setText(text)
             self._anim_frame.show()
-            if not self._timer_is_running():
+            if not self._pulse.is_running():
                 self._pulse.start()
         else:
-            self._thinking_label.setText("思考中")
+            self._thinking_label.setText("Thinking…")
             self._pulse.stop()
             self._anim_frame.hide()
 
-    def _timer_is_running(self) -> bool:
-        try:
-            return self._pulse._timer.isActive()
-        except Exception:
-            return False
-
     def update_text(self, text: str, append: bool = True):
-        """Receives streamed tokens from the UI queue."""
+        """Receives streamed tokens from the UI queue (perf — issue #16)."""
         if not append:
             self._full_text = text
+            trimmed = False
+            self._content.clear()
+            if text:
+                self._append_delta_html(text)
         else:
             self._full_text += text
-            self._trim_conversation_blocks()
+            trimmed = self._trim_conversation_blocks()
+            if trimmed:
+                self._rerender_full()
+            elif text:
+                self._append_delta_html(text)
 
         # Stop thinking animation on first real token
         if self._anim_frame.isVisible() and text:
             self._pulse.stop()
             self._anim_frame.hide()
 
-        # Render as basic HTML (bold, code, newlines)
-        html = self._to_html(self._full_text)
-        self._content.setText(html)
+    def _append_delta_html(self, text: str) -> None:
+        """Append only the delta as HTML (sticky-bottom — issue #18)."""
+        sb = self._content.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - _STICKY_BOTTOM_TOLERANCE_PX
+        cursor = self._content.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertHtml(self._to_html(text))
+        if at_bottom:
+            self._schedule_scroll_to_bottom()
 
-        # Auto-scroll to bottom
-        sb = self._scroll.verticalScrollBar()
-        sb.setValue(sb.maximum())
+    def _schedule_scroll_to_bottom(self) -> None:
+        # Read scrollbar maximum AFTER layout (perf — issue #16).
+        def _do_scroll():
+            sb = self._content.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        QTimer.singleShot(0, _do_scroll)
+
+    # ── HTML rendering ────────────────────────────────────────────────────
 
     @staticmethod
     def _to_html(text: str) -> str:
         """
-        Lightweight Markdown-to-HTML: handles **bold**, `code`, code blocks,
-        and line breaks — enough for the structured prompts we generate.
+        Lightweight Markdown-to-HTML: handles **bold**, `code`, fenced code
+        blocks (with optional Pygments syntax highlighting), and line breaks.
+        Uses module-level precompiled regexes.
         """
-        import re
+        pal = theme.palette()
+
         # Escape HTML special chars first
         text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        # Code fences ```lang\n...\n``` → styled block
         def replace_fence(m):
             lang = m.group(1) or "text"
-            code = m.group(2).strip()
+            code = m.group(2).rstrip()
+            if HAS_PYGMENTS:
+                try:
+                    lexer = _pyg_get_lexer(lang.strip().lower() or "text")
+                    inner = _pyg_highlight(code, lexer, _PYG_FORMATTER)
+                    return (
+                        f'<div style="background:{pal["code_bg"]};border-radius:6px;'
+                        f'border:1px solid {pal["border"]};margin:6px 0;padding:8px 12px;">'
+                        f'<span style="color:{pal["code_lang"]};font-size:10px;">{lang}</span>'
+                        f'{inner}</div>'
+                    )
+                except _PygClassNotFound:
+                    pass
+                except Exception:
+                    pass
             return (
-                f'<div style="background:rgba(0,0,0,0.5);border-radius:6px;'
-                f'border:1px solid rgba(255,255,255,0.12);margin:6px 0;padding:8px 12px;">'
-                f'<span style="color:#6b7280;font-size:10px;">{lang}</span><br>'
-                f'<pre style="margin:0;color:#e5e7eb;font-family:Consolas,monospace;'
+                f'<div style="background:{pal["code_bg"]};border-radius:6px;'
+                f'border:1px solid {pal["border"]};margin:6px 0;padding:8px 12px;">'
+                f'<span style="color:{pal["code_lang"]};font-size:10px;">{lang}</span><br>'
+                f'<pre style="margin:0;color:{pal["code_text"]};font-family:Consolas,monospace;'
                 f'font-size:12px;white-space:pre-wrap;">{code}</pre></div>'
             )
-        text = re.sub(r"```(\w*)\n([\s\S]*?)```", replace_fence, text)
+        text = _RE_FENCE.sub(replace_fence, text)
 
-        # Inline `code`
-        text = re.sub(
-            r"`([^`]+)`",
-            r'<code style="background:rgba(0,0,0,0.45);border-radius:3px;'
-            r'padding:1px 4px;font-family:Consolas,monospace;color:#a8d8a8;">\1</code>',
+        text = _RE_INLINE.sub(
+            f'<code style="background:{pal["code_inline_bg"]};border-radius:3px;'
+            f'padding:1px 4px;font-family:Consolas,monospace;color:{pal["code_inline"]};">'
+            r'\1</code>',
             text,
         )
-        # **bold**
-        text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-        # newlines → <br>
+        text = _RE_BOLD.sub(r"<b>\1</b>", text)
         text = text.replace("\n", "<br>")
 
-        return f'<span style="color:{_TEXT_PRIMARY}">{text}</span>'
+        return f'<span style="color:{pal["text_primary"]}">{text}</span>'
+
+    # ── Interaction / stealth ────────────────────────────────────────────
 
     def _flash_bottom_status(self, message: str, duration_ms: int = 1500) -> None:
-        """Brief bottom-line hint without touching `_full_text` (does not interrupt ASR/LLM body)."""
         timer = self._status_flash_timer
         if timer is None:
             return
@@ -411,7 +644,7 @@ class OverlayUI(QMainWindow):
 
         prev_text = self._thinking_label.text()
         prev_anim_visible = self._anim_frame.isVisible()
-        prev_pulse = self._timer_is_running()
+        prev_pulse = self._pulse.is_running()
 
         self._thinking_label.setText(message)
         self._anim_frame.show()
@@ -434,15 +667,39 @@ class OverlayUI(QMainWindow):
         self.is_interactive = not self.is_interactive
         if sys.platform == "win32":
             set_window_interaction_mode(int(self.winId()), self.is_interactive)
-        mode = "🖱️ 可拖拽" if self.is_interactive else "👻 隐身穿透"
+        mode = "🖱️ Interactive" if self.is_interactive else "👻 Click-through"
         logger.info(f"Interaction mode → {mode}")
-        self._flash_bottom_status(f"已切换至 {mode} 模式")
+        self._header.set_lock_state(self.is_interactive)
+        self._flash_bottom_status(f"Switched to {mode}")
 
     def set_interaction(self, interactive: bool):
-        """Force interaction mode (does not toggle)."""
         self.is_interactive = bool(interactive)
         if sys.platform == "win32":
             set_window_interaction_mode(int(self.winId()), self.is_interactive)
-        mode = "🖱️ 可拖拽" if self.is_interactive else "👻 隐身穿透"
+        mode = "🖱️ Interactive" if self.is_interactive else "👻 Click-through"
         logger.info(f"Interaction mode → {mode}")
-        self._flash_bottom_status(f"已切换至 {mode} 模式")
+        self._header.set_lock_state(self.is_interactive)
+        self._flash_bottom_status(f"Switched to {mode}")
+
+    # ── Geometry persistence (issue #19) ─────────────────────────────────
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._schedule_geometry_save()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._schedule_geometry_save()
+
+    def _schedule_geometry_save(self) -> None:
+        if self._geom_save_timer is not None:
+            self._geom_save_timer.start()
+
+    def _save_geometry(self) -> None:
+        g = self.geometry()
+        value = [g.x(), g.y(), g.width(), g.height()]
+        try:
+            setattr(config, self._geometry_key, value)
+            _write_config_json({self._geometry_key: value})
+        except Exception as e:
+            logger.debug(f"Geometry persist failed: {e}")

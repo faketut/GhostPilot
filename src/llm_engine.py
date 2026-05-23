@@ -103,7 +103,18 @@ Reply with JSON only, no markdown. Schema:
 Use the same definitions as a text classifier: behavioral = soft skills, STAR stories, motivation/why-us/fit/self-intro; technical = concepts/design/tools; algorithm = coding/DSA."""
 
 
-_ENGLISH_SUFFIX = "\n\nOutput language: English. Respond in English only."
+def _lang_suffix() -> str:
+    """Return the language-control suffix appended to every system prompt.
+
+    Driven by `config.RESPONSE_LANGUAGE` so the Settings UI choice takes effect
+    on the very next LLM call (no restart needed).
+    """
+    lang = (getattr(config, "RESPONSE_LANGUAGE", "auto") or "auto").strip().lower()
+    if lang == "en":
+        return "\n\nOutput language: English. Respond in English only."
+    if lang == "zh":
+        return "\n\nOutput language: Chinese. Respond in Chinese only."
+    return ""  # auto → let each prompt's built-in rule decide
 
 
 # ── LLM Engine ────────────────────────────────────────────────────────────
@@ -127,19 +138,17 @@ class LLMEngine:
         else:
             self.text_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 
-        # Vision LLM — choose provider based on model name
+        # Vision LLM — choose provider based on model name.
+        # DeepSeek vision models are rejected later in `generate_vision_answer_stream`
+        # (their /chat/completions does not accept image_url content blocks),
+        # so we only build a client for the providers we actually call.
         vm = (config.VISION_MODEL or "").lower()
-        self._vision_provider = "openai_compatible"
         self.vision_client = None
 
         if vm.startswith("gemini"):
             self._vision_provider = "gemini"
         elif _is_deepseek_model(config.VISION_MODEL):
             self._vision_provider = "deepseek"
-            self.vision_client = AsyncOpenAI(
-                api_key=config.DEEPSEEK_API_KEY,
-                base_url="https://api.deepseek.com/v1",
-            )
         else:
             self._vision_provider = "openai_compatible"
             self.vision_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
@@ -233,7 +242,7 @@ class LLMEngine:
         vision_mode: bool,
         visible_question: str = "",
     ) -> list[dict]:
-        system_prompt = get_prompt(q_type) + _ENGLISH_SUFFIX
+        system_prompt = get_prompt(q_type) + _lang_suffix()
 
         parts: list[str] = []
         if context_snippets:
@@ -310,7 +319,7 @@ class LLMEngine:
     async def _vision_step_a_openai(self, compressed: bytes) -> tuple[str, str]:
         b64 = base64.b64encode(compressed).decode("utf-8")
         messages = [
-            {"role": "system", "content": _VISION_STEP_A_SYSTEM + _ENGLISH_SUFFIX},
+            {"role": "system", "content": _VISION_STEP_A_SYSTEM + _lang_suffix()},
             {
                 "role": "user",
                 "content": [
@@ -353,7 +362,7 @@ class LLMEngine:
 
         client = genai.Client(api_key=config.GEMINI_API_KEY)
         gemini_config = types.GenerateContentConfig(
-            system_instruction=_VISION_STEP_A_SYSTEM + _ENGLISH_SUFFIX,
+            system_instruction=_VISION_STEP_A_SYSTEM + _lang_suffix(),
             max_output_tokens=256,
             temperature=0.1,
         )

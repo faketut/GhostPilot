@@ -13,4 +13,4 @@ __pycache__/
 *.pyzwzw
 config.json
 
-knowledge/*
+knowledge/*.DS_Store

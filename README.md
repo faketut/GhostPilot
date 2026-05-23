@@ -95,3 +95,21 @@ On startup the app will:
 
 - **PyQt6 DLL load failed**: prefer installing PyQt/Qt via conda-forge (`conda install -c conda-forge pyqt=6 qt-main`) and make sure VC++ 2015-2022 x64 runtime is installed.
 - **Alt+P / Vision failures**: vision pipeline is isolated; failures should show only in the Vision overlay and not stop ASR.
+
+## Settings UI
+
+Open from the system tray (right-click → Settings) or the ⚙️ button on the ASR overlay. Tabs:
+
+- **🎙️ Azure** — Speech key / region / endpoint, ASR language
+- **🤖 LLM** — OpenAI / DeepSeek / Gemini keys, text & vision models
+- **⌨️ Hotkeys** — all bindings (primary + backup)
+- **🌐 Language** — LLM response language (`auto` / `zh` / `en`)
+
+Secret fields all have a 👁 show/hide toggle. Most changes apply immediately — no restart needed.
+
+## Security
+
+- API keys are stored in `config.json` (and/or `.env`) as **plain text** on disk. Both files are listed in `.gitignore` — do not commit them.
+- The app never sends keys anywhere except to the configured providers (Azure / OpenAI / DeepSeek / Gemini).
+- Screenshots taken via `Alt+P` are sent to the configured vision model and are not persisted to disk.
+- For best operational hygiene: use a separate API key per machine and rotate periodically.

@@ -11,3 +11,4 @@ Pillow>=10.2.0
 onnxruntime>=1.17.1
 sentence-transformers>=2.5.1
 python-dotenv>=1.0.1
+Pygments>=2.17.0

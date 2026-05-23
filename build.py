@@ -34,7 +34,8 @@ BUILD_DIR    = "build"
 
 # Data files to bundle (src → dest_folder_in_bundle)
 EXTRA_DATA = [
-    # ("prompts", "prompts"),           # uncomment if you add a prompts/ folder
+    ("prompts", "prompts"),
+    ("knowledge", "knowledge"),
 ]
 
 # Hidden imports that PyInstaller sometimes misses

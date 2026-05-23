@@ -6,11 +6,10 @@ capture an exact rectangular region of the screen.  The captured region is retur
 as raw PNG bytes (in memory — never written to disk).
 
 Usage:
-    area_bytes = AreaCapture.capture()   # blocks until selection is done / cancelled
-    # area_bytes is None if the user pressed Escape or selected a degenerate region
+    image_bytes = await AreaCapture.capture_async()
+    # image_bytes is None if the user pressed Escape or selected a degenerate region
 """
 
-import sys
 import logging
 import io
 from typing import Optional
@@ -26,17 +25,25 @@ logger = logging.getLogger(__name__)
 try:
     from PyQt6.QtWidgets import QWidget, QApplication
     from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal
-    from PyQt6.QtGui import QPainter, QColor, QPen, QScreen, QPixmap
+    from PyQt6.QtGui import QPainter, QColor, QPen, QScreen, QPixmap, QFont
     HAS_QT = True
 except ImportError:
     HAS_QT = False
     logger.warning("PyQt6 not available — AreaCapture will fall back to full-screen capture.")
 
 
+_MIN_SELECTION_PX = 10
+
+
 class _SelectionOverlay(QWidget):
     """
     A full-screen, semi-transparent widget that lets the user drag a rectangle.
     After the user releases the mouse the selected region is stored in `self.selection`.
+
+    Keyboard shortcuts:
+      - Esc                 → cancel
+      - Enter / Return      → confirm current selection
+      - Arrow keys          → grow/shrink the selection by 1px (Shift = 10px)
     """
 
     closed = pyqtSignal()
@@ -45,6 +52,7 @@ class _SelectionOverlay(QWidget):
         super().__init__()
         self.selection: Optional[QRect] = None
         self._origin: Optional[QPoint] = None
+        self._cursor_pos: Optional[QPoint] = None
         self._rubber: QRect = QRect()
         self._cancelled: bool = False
 
@@ -63,6 +71,7 @@ class _SelectionOverlay(QWidget):
         geo = screen.geometry()
         self.setGeometry(geo)
         self.showFullScreen()
+        self.setFocus()
 
     def closeEvent(self, event):
         try:
@@ -72,44 +81,101 @@ class _SelectionOverlay(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-
-        # Draw the desktop snapshot as the background
         painter.drawPixmap(self.rect(), self._background)
-
-        # Dark translucent overlay over everything outside the selection
         painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
 
         if not self._rubber.isNull():
-            # Cut out (highlight) the selected region
             painter.fillRect(self._rubber, QColor(0, 0, 0, 0))
-
-            # Draw a bright border around the selection
             pen = QPen(QColor(0, 200, 255), 2, Qt.PenStyle.SolidLine)
             painter.setPen(pen)
             painter.drawRect(self._rubber)
+            self._paint_size_label(painter)
+
+    def _paint_size_label(self, painter: QPainter) -> None:
+        w = self._rubber.width()
+        h = self._rubber.height()
+        if w <= 0 or h <= 0:
+            return
+        text = f"{w} × {h}"
+        font = QFont("Segoe UI", 10)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        text_w = metrics.horizontalAdvance(text) + 12
+        text_h = metrics.height() + 6
+
+        anchor = self._cursor_pos or self._rubber.bottomRight()
+        x = anchor.x() + 14
+        y = anchor.y() + 14
+        sw = self.width()
+        sh = self.height()
+        if x + text_w > sw:
+            x = anchor.x() - text_w - 14
+        if y + text_h > sh:
+            y = anchor.y() - text_h - 14
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
+        bg = QRect(x, y, text_w, text_h)
+        painter.fillRect(bg, QColor(0, 0, 0, 180))
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(bg, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _confirm(self) -> None:
+        if self._rubber.isNull():
+            self.close()
+            return
+        rect = self._rubber.normalized()
+        if rect.width() > _MIN_SELECTION_PX and rect.height() > _MIN_SELECTION_PX:
+            self.selection = rect
+        self.close()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
             self._cancelled = True
             self.close()
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._confirm()
+            return
+
+        if self._rubber.isNull():
+            return
+        step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+        r = QRect(self._rubber)
+        if key == Qt.Key.Key_Left:
+            r.setRight(max(r.left() + _MIN_SELECTION_PX, r.right() - step))
+        elif key == Qt.Key.Key_Right:
+            r.setRight(min(self.width() - 1, r.right() + step))
+        elif key == Qt.Key.Key_Up:
+            r.setBottom(max(r.top() + _MIN_SELECTION_PX, r.bottom() - step))
+        elif key == Qt.Key.Key_Down:
+            r.setBottom(min(self.height() - 1, r.bottom() + step))
+        else:
+            return
+        self._rubber = r.normalized()
+        self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._origin = event.pos()
+            self._cursor_pos = event.pos()
             self._rubber = QRect(self._origin, self._origin)
             self.update()
 
     def mouseMoveEvent(self, event):
         if self._origin:
+            self._cursor_pos = event.pos()
             self._rubber = QRect(self._origin, event.pos()).normalized()
             self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._origin:
-            final = QRect(self._origin, event.pos()).normalized()
-            if final.width() > 10 and final.height() > 10:
-                self.selection = final
-            self.close()
+            self._cursor_pos = event.pos()
+            self._rubber = QRect(self._origin, event.pos()).normalized()
+            self._confirm()
 
 
 class AreaCapture:
@@ -117,40 +183,6 @@ class AreaCapture:
     Public interface for triggering an interactive area capture.
     Returns PNG bytes (in-memory) or None if cancelled.
     """
-
-    @staticmethod
-    def capture() -> Optional[bytes]:
-        """
-        Displays a full-screen drag-to-select overlay and returns the selected region
-        as compressed JPEG bytes ready to be passed to the vision LLM.
-        Returns None if the user cancelled.
-        """
-        if not HAS_QT:
-            return AreaCapture._full_screen_fallback()
-
-        overlay = _SelectionOverlay()
-        # Legacy sync capture kept for compatibility.
-        # Prefer capture_async() in async apps (qasync) to avoid nested loops.
-        app = QApplication.instance()
-        if app is None:
-            logger.error("QApplication instance not found; cannot run area capture.")
-            return None
-
-        # Wait by pumping events (lightweight) with a tiny sleep to avoid CPU spin.
-        # This avoids nested Qt event loops, but still blocks the caller thread.
-        while overlay.isVisible():
-            app.processEvents()
-            try:
-                import time
-                time.sleep(0.005)
-            except Exception:
-                pass
-
-        if overlay._cancelled or overlay.selection is None:
-            logger.info("Area capture cancelled.")
-            return None
-
-        return AreaCapture._grab_rect_png(overlay.selection)
 
     @staticmethod
     async def capture_async() -> Optional[bytes]:
@@ -177,7 +209,6 @@ class AreaCapture:
             logger.info("Area capture cancelled.")
             return None
 
-        # Grab pixels off the UI thread (can be slow on some machines).
         return await asyncio.to_thread(AreaCapture._grab_rect_png, rect)
 
     @staticmethod

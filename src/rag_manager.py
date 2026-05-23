@@ -7,6 +7,7 @@ import numpy as np
 try:
     from sentence_transformers import SentenceTransformer
     HAS_ST = True
+    _ST_IMPORT_ERROR: Exception | None = None
 except Exception as e:
     HAS_ST = False
     _ST_IMPORT_ERROR = e
@@ -37,9 +38,8 @@ class RAGManager:
                 logger.warning(f"Failed to init sentence-transformers (RAG disabled): {e}")
                 self.model = None
         else:
-            err = globals().get("_ST_IMPORT_ERROR")
-            if err:
-                logger.warning(f"sentence-transformers unavailable (RAG disabled): {err}")
+            if _ST_IMPORT_ERROR is not None:
+                logger.warning(f"sentence-transformers unavailable (RAG disabled): {_ST_IMPORT_ERROR}")
             else:
                 logger.warning("sentence-transformers unavailable (RAG disabled).")
 

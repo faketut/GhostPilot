@@ -48,7 +48,7 @@ class ASRClient:
         # Callbacks
         def transcribing_cb(evt: speechsdk.SpeechRecognitionEventArgs):
             text = evt.result.text
-            # 优化手段一：流式增量输出，利用 length/confidence 阈值防止下游频繁抖动
+            # Skip very short partials to avoid downstream UI thrashing.
             if text and len(text) > 8:
                 speaker_id = evt.result.speaker_id if evt.result.speaker_id else "Unknown"
                 loop.call_soon_threadsafe(text_queue.put_nowait, {

@@ -128,9 +128,20 @@ class AudioCapture:
 
     def last_callback_age_sec(self) -> float:
         import time
+        # If start() failed or we haven't been started yet, report 0 so the
+        # watchdog doesn't busy-loop attempting restarts on the same broken state.
+        # The watchdog separately checks `last_error` / `_is_running` to decide.
         if not self._last_callback_ts:
-            return 1e9
+            return 0.0
         return max(0.0, time.time() - self._last_callback_ts)
+
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
 
     def restart(self, output_queue: asyncio.Queue, *, device_name_contains: str = ""):
         """Best-effort restart on device change/driver hiccup."""

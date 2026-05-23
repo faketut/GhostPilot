@@ -4,12 +4,22 @@ import asyncio
 import os
 
 from src.windows_api import set_dpi_awareness
-from src.audio_capture import AudioCapture
 from src.asr_client import ASRClient
 from src.rag_manager import RAGManager
 from src.llm_engine import LLMEngine
 from src.hotkey_manager import HotkeyManager
 from src.config import config
+
+# Defer audio_capture import (pyaudiowpatch is Windows-only); on macOS/Linux
+# devs can still run UI / RAG / prompts iteration without the audio pipeline.
+try:
+    from src.audio_capture import AudioCapture
+    AUDIO_AVAILABLE = True
+    _AUDIO_IMPORT_ERROR: Exception | None = None
+except Exception as e:
+    AudioCapture = None  # type: ignore[assignment]
+    AUDIO_AVAILABLE = False
+    _AUDIO_IMPORT_ERROR = e
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -44,7 +54,6 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
 
 async def run_pipelines(app, loop):
     """Main async task: wires all modules together inside the qasync loop."""
-    set_dpi_awareness()
     # Import Qt-dependent modules only after Qt is confirmed importable.
     from src.settings_ui import apply_saved_config
     from src.overlay_ui import OverlayUI
@@ -55,7 +64,13 @@ async def run_pipelines(app, loop):
     ui_asr = None
     ui_vision = None
 
-    audio_capture = AudioCapture(sample_rate=config.SAMPLE_RATE, chunk_size=config.CHUNK_SIZE)
+    audio_capture = AudioCapture(sample_rate=config.SAMPLE_RATE, chunk_size=config.CHUNK_SIZE) if AUDIO_AVAILABLE else None
+    if not AUDIO_AVAILABLE:
+        logger.warning(
+            "Audio capture unavailable on this platform (%s). "
+            "ASR/audio pipeline is disabled; UI and Vision still work. Reason: %s",
+            sys.platform, _AUDIO_IMPORT_ERROR,
+        )
     asr_client = ASRClient(
         config.AZURE_SPEECH_KEY,
         config.AZURE_SPEECH_REGION,
@@ -168,6 +183,14 @@ async def run_pipelines(app, loop):
 
             # Hotkeys are registered once → rebuild to apply new bindings
             _rebuild_hotkeys()
+
+            # Refresh hotkey hints rendered in each overlay's footer
+            for _ov in (ui_asr, ui_vision):
+                if _ov is not None and hasattr(_ov, "refresh_footer"):
+                    try:
+                        _ov.refresh_footer()
+                    except Exception:
+                        pass
 
             # ASR language/keys changes require restarting the Azure transcriber
             _restart_asr()
@@ -381,6 +404,7 @@ async def run_pipelines(app, loop):
             logger.error(f"ASR finalize error: {e}")
 
     async def asr_router():
+        nonlocal pending_partial, partial_timer
         while True:
             try:
                 msg = await text_queue.get()
@@ -437,7 +461,8 @@ async def run_pipelines(app, loop):
         pass
     finally:
         logger.info("Shutting down pipelines...")
-        audio_capture.stop()
+        if audio_capture is not None:
+            audio_capture.stop()
         asr_client.stop()
         if hk_screenshot:
             hk_screenshot.stop()

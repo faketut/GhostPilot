@@ -14,11 +14,15 @@ If a file is missing, a sensible inline fallback is used so the app never crashe
 """
 
 import logging
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_DIR = Path(__file__).parent.parent / "prompts"
+# When frozen by PyInstaller, bundled data lives under sys._MEIPASS; otherwise
+# use the repo root (two levels up from this file).
+_BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
+_PROMPT_DIR = _BASE_DIR / "prompts"
 
 # ── Inline fallbacks (used when .md file is absent) ──────────────────────
 _FALLBACKS: dict[str, str] = {
@@ -72,14 +76,6 @@ def _load(q_type: str) -> str:
 def get_prompt(q_type: str) -> str:
     """Return the system prompt for the given question type."""
     return _load(q_type)
-
-
-def reload_all():
-    """Force-reload all cached prompts from disk (useful after in-app edits)."""
-    _cache.clear()
-    for q_type in _FALLBACKS:
-        _load(q_type)
-    logger.info("All prompts reloaded from disk.")
 
 
 # Pre-load at import time so first LLM call has zero disk I/O

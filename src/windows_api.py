@@ -60,6 +60,37 @@ def set_window_interaction_mode(hwnd: int, interactive: bool):
     except Exception as e:
         logger.error(f"Failed to set interaction mode: {e}")
 
+# DWM backdrop constants (Windows 11 22H2+)
+DWMWA_SYSTEMBACKDROP_TYPE = 38
+DWMSBT_DISABLE = 1
+DWMSBT_MAINWINDOW = 2          # Mica
+DWMSBT_TRANSIENTWINDOW = 3     # Acrylic
+DWMSBT_TABBEDWINDOW = 4
+
+def enable_mica(hwnd: int, *, acrylic: bool = False) -> bool:
+    """
+    Request a native Mica (or Acrylic) backdrop for the given window.
+    Silent no-op on non-Windows or pre-Win11 22H2 systems.
+    Returns True on success, False if the OS / driver does not support it.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        kind = DWMSBT_TRANSIENTWINDOW if acrylic else DWMSBT_MAINWINDOW
+        value = ctypes.c_int(kind)
+        hr = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ctypes.byref(value), ctypes.sizeof(value)
+        )
+        if hr == 0:
+            logger.info("Mica/Acrylic backdrop enabled (acrylic=%s).", acrylic)
+            return True
+        logger.debug("DwmSetWindowAttribute(BACKDROP_TYPE) returned 0x%x", hr)
+        return False
+    except Exception as e:
+        logger.debug(f"Mica unavailable: {e}")
+        return False
+
+
 def set_dpi_awareness():
     """
     Sets the process DPI awareness to Per-Monitor V2 to ensure correct screenshot coordinates 

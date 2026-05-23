@@ -1,70 +1,112 @@
+"""
+Settings UI
+-----------
+Tabbed Qt dialog with show/hide toggles on every secret field.  Persists to
+config.json and hot-patches the in-memory `config` so most changes apply
+without a restart.
+"""
+
 import json
 import os
 import logging
 from typing import Callable, Optional
+
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QFormLayout,
+    QDialog, QVBoxLayout, QFormLayout, QTabWidget, QWidget,
     QLineEdit, QPushButton, QMessageBox,
-    QHBoxLayout, QLabel, QComboBox, QGroupBox,
+    QHBoxLayout, QComboBox,
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction
+
 from src.config import config
+from src import theme
 
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = "config.json"
 
-_DARK_STYLE = """
-QDialog {
-    background-color: #1e1e2e;
-    color: #cdd6f4;
+
+def _dark_stylesheet() -> str:
+    pal = theme.palette()
+    return f"""
+QDialog {{
+    background-color: {pal['dialog_bg']};
+    color: {pal['text_primary']};
     font-family: 'Segoe UI', sans-serif;
     font-size: 13px;
-}
-QGroupBox {
-    border: 1px solid #45475a;
+}}
+QTabWidget::pane {{
+    border: 1px solid {pal['dialog_border']};
     border-radius: 6px;
-    margin-top: 8px;
-    padding-top: 4px;
-    color: #89b4fa;
-    font-weight: bold;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-}
-QLabel { color: #cdd6f4; }
-QLineEdit, QComboBox {
-    background-color: #313244;
-    border: 1px solid #45475a;
+    top: -1px;
+}}
+QTabBar::tab {{
+    background: transparent;
+    color: {pal['text_dim']};
+    padding: 6px 14px;
+    margin-right: 2px;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+}}
+QTabBar::tab:selected {{
+    background: {pal['dialog_field']};
+    color: {pal['accent_blue']};
+    border-color: {pal['dialog_border']};
+}}
+QLabel {{ color: {pal['text_primary']}; }}
+QLineEdit, QComboBox {{
+    background-color: {pal['dialog_field']};
+    border: 1px solid {pal['dialog_border']};
     border-radius: 4px;
     padding: 4px 8px;
-    color: #cdd6f4;
-}
-QLineEdit:focus, QComboBox:focus { border-color: #89b4fa; }
-QPushButton {
-    background-color: #89b4fa;
-    color: #1e1e2e;
+    color: {pal['text_primary']};
+}}
+QLineEdit:focus, QComboBox:focus {{ border-color: {pal['accent_blue']}; }}
+QPushButton {{
+    background-color: {pal['dialog_btn']};
+    color: {pal['dialog_bg']};
     border: none;
     border-radius: 5px;
     padding: 6px 18px;
     font-weight: bold;
-}
-QPushButton:hover { background-color: #b4befe; }
-QPushButton#cancelBtn {
-    background-color: #45475a;
-    color: #cdd6f4;
-}
-QPushButton#cancelBtn:hover { background-color: #585b70; }
+}}
+QPushButton:hover {{ background-color: {pal['dialog_btn_hi']}; }}
+QPushButton#cancelBtn {{
+    background-color: {pal['dialog_btn2']};
+    color: {pal['text_primary']};
+}}
+QPushButton#cancelBtn:hover {{ background-color: {pal['dialog_btn2_hi']}; }}
 """
+
+
+# Centralised field schema (issue #20: "adding a new field requires changes in exactly one place").
+# Each entry: (config_key, label, kind)
+#   kind ∈ {"text", "secret", "combo:<id>"}
+_ASR_LANG_OPTIONS = [
+    ("zh-CN — 中文（普通话）", "zh-CN"),
+    ("en-US — English (US)", "en-US"),
+    ("en-GB — English (UK)", "en-GB"),
+    ("ja-JP — 日本語", "ja-JP"),
+    ("ko-KR — 한국어", "ko-KR"),
+    ("de-DE — Deutsch", "de-DE"),
+    ("fr-FR — Français", "fr-FR"),
+]
+_RESPONSE_LANG_OPTIONS = [
+    ("Auto (follow question language)", "auto"),
+    ("中文 (Chinese)", "zh"),
+    ("English", "en"),
+]
 
 
 class SettingsUI(QDialog):
     def __init__(self, parent=None, *, on_saved: Optional[Callable[[dict], None]] = None):
         super().__init__(parent)
         self.setWindowTitle("GhostPilot Copilot — Settings")
-        self.setMinimumWidth(460)
-        self.setStyleSheet(_DARK_STYLE)
+        self.setMinimumWidth(520)
+        self.setStyleSheet(_dark_stylesheet())
         self.setWindowFlags(
             Qt.WindowType.Dialog
             | Qt.WindowType.WindowStaysOnTopHint
@@ -72,85 +114,64 @@ class SettingsUI(QDialog):
 
         self._on_saved = on_saved
         self.saved_config = self._load_config()
+        # Maps config key → (kind, widget). Saved/loaded generically.
+        self._fields: dict[str, tuple[str, QWidget]] = {}
+
         root = QVBoxLayout(self)
         root.setSpacing(12)
         root.setContentsMargins(16, 16, 16, 16)
 
-        # ── Azure Speech ──────────────────────────────────────────────────
-        azure_group = QGroupBox("🎙️ Azure Speech Service")
-        azure_form = QFormLayout(azure_group)
+        tabs = QTabWidget(self)
 
-        self.azure_key_input = self._secret_field("AZURE_SPEECH_KEY", config.AZURE_SPEECH_KEY)
-        azure_form.addRow("Subscription Key:", self.azure_key_input)
+        # ── Tab: Azure ──
+        azure = QFormLayout()
+        azure_w = QWidget()
+        azure_w.setLayout(azure)
+        azure.addRow("Subscription key:",   self._add_secret("AZURE_SPEECH_KEY", config.AZURE_SPEECH_KEY))
+        azure.addRow("Region (e.g. eastus):", self._add_text("AZURE_SPEECH_REGION", config.AZURE_SPEECH_REGION))
+        azure.addRow("Custom endpoint (optional):", self._add_text("AZURE_SPEECH_ENDPOINT", config.AZURE_SPEECH_ENDPOINT))
+        azure.addRow("ASR language:", self._add_combo("ASR_LANGUAGE", config.ASR_LANGUAGE, _ASR_LANG_OPTIONS))
+        tabs.addTab(azure_w, "🎙️ Azure")
 
-        self.azure_region_input = self._plain_field("AZURE_SPEECH_REGION", config.AZURE_SPEECH_REGION)
-        azure_form.addRow("Region (e.g. eastus):", self.azure_region_input)
+        # ── Tab: LLM ──
+        llm = QFormLayout()
+        llm_w = QWidget()
+        llm_w.setLayout(llm)
+        llm.addRow("OpenAI API key:",   self._add_secret("OPENAI_API_KEY", config.OPENAI_API_KEY))
+        llm.addRow("DeepSeek API key:", self._add_secret("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY))
+        llm.addRow("Gemini API key:",   self._add_secret("GEMINI_API_KEY", config.GEMINI_API_KEY))
+        llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
+        llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
+        tabs.addTab(llm_w, "🤖 LLM")
 
-        self.asr_language_combo = QComboBox()
-        languages = [
-            ("zh-CN — 中文（普通话）", "zh-CN"),
-            ("en-US — English (US)", "en-US"),
-            ("en-GB — English (UK)", "en-GB"),
-            ("ja-JP — 日本語", "ja-JP"),
-            ("ko-KR — 한국어", "ko-KR"),
-            ("de-DE — Deutsch", "de-DE"),
-            ("fr-FR — Français", "fr-FR"),
-        ]
-        current_lang = self.saved_config.get("ASR_LANGUAGE", config.ASR_LANGUAGE)
-        for label, code in languages:
-            self.asr_language_combo.addItem(label, code)
-        for i, (_, code) in enumerate(languages):
-            if code == current_lang:
-                self.asr_language_combo.setCurrentIndex(i)
-                break
-        azure_form.addRow("ASR Language:", self.asr_language_combo)
-        root.addWidget(azure_group)
+        # ── Tab: Hotkeys (issue #4) ──
+        hk = QFormLayout()
+        hk_w = QWidget()
+        hk_w.setLayout(hk)
+        hk.addRow("Screenshot (Vision):",        self._add_text("SCREENSHOT_HOTKEY", config.SCREENSHOT_HOTKEY))
+        hk.addRow("Both overlays (primary):",    self._add_text("ASR_INTERACTION_HOTKEY", config.ASR_INTERACTION_HOTKEY))
+        hk.addRow("Both overlays (backup):",     self._add_text("ASR_INTERACTION_HOTKEY_BACKUP", config.ASR_INTERACTION_HOTKEY_BACKUP))
+        hk.addRow("Vision overlay (primary):",   self._add_text("VISION_INTERACTION_HOTKEY", config.VISION_INTERACTION_HOTKEY))
+        hk.addRow("Vision overlay (backup):",    self._add_text("VISION_INTERACTION_HOTKEY_BACKUP", config.VISION_INTERACTION_HOTKEY_BACKUP))
+        hk.addRow("Force stealth (primary):",    self._add_text("FORCE_STEALTH_HOTKEY", config.FORCE_STEALTH_HOTKEY))
+        hk.addRow("Force stealth (backup):",     self._add_text("FORCE_STEALTH_HOTKEY_BACKUP", config.FORCE_STEALTH_HOTKEY_BACKUP))
+        hk.addRow("Both overlays (alias):",      self._add_text("INTERACTION_HOTKEY", config.INTERACTION_HOTKEY))
+        tabs.addTab(hk_w, "⌨️ Hotkeys")
 
-        # ── LLM Providers ─────────────────────────────────────────────────
-        llm_group = QGroupBox("🤖 LLM Providers")
-        llm_form = QFormLayout(llm_group)
+        # ── Tab: Language ──
+        lang = QFormLayout()
+        lang_w = QWidget()
+        lang_w.setLayout(lang)
+        lang.addRow("LLM response language:", self._add_combo(
+            "RESPONSE_LANGUAGE",
+            getattr(config, "RESPONSE_LANGUAGE", "auto"),
+            _RESPONSE_LANG_OPTIONS,
+        ))
+        tabs.addTab(lang_w, "🌐 Language")
 
-        self.openai_key_input = self._secret_field("OPENAI_API_KEY", config.OPENAI_API_KEY)
-        llm_form.addRow("OpenAI API Key:", self.openai_key_input)
+        root.addWidget(tabs, 1)
 
-        self.deepseek_key_input = self._secret_field("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY)
-        llm_form.addRow("DeepSeek API Key:", self.deepseek_key_input)
-
-        self.text_model_input = self._plain_field("TEXT_MODEL", config.TEXT_MODEL)
-        llm_form.addRow("Text Model:", self.text_model_input)
-
-        self.vision_model_input = self._plain_field("VISION_MODEL", config.VISION_MODEL)
-        llm_form.addRow("Vision Model:", self.vision_model_input)
-        root.addWidget(llm_group)
-
-        # ── Hotkeys ───────────────────────────────────────────────────────
-        hk_group = QGroupBox("⌨️ Hotkeys")
-        hk_form = QFormLayout(hk_group)
-
-        self.screenshot_hk_input = self._plain_field("SCREENSHOT_HOTKEY", config.SCREENSHOT_HOTKEY)
-        hk_form.addRow("Screenshot (Vision):", self.screenshot_hk_input)
-
-        self.interaction_hk_input = self._plain_field("INTERACTION_HOTKEY", config.INTERACTION_HOTKEY)
-        hk_form.addRow("Toggle Interaction:", self.interaction_hk_input)
-        root.addWidget(hk_group)
-
-        # ── Language ─────────────────────────────────────────────────────
-        lang_group = QGroupBox("🌐 Language / 输出语言")
-        lang_form = QFormLayout(lang_group)
-
-        self.response_lang_combo = QComboBox()
-        self.response_lang_combo.addItem("Auto (跟随问题语言)", "auto")
-        self.response_lang_combo.addItem("中文 (Chinese)", "zh")
-        self.response_lang_combo.addItem("English", "en")
-        current_lang = self.saved_config.get("RESPONSE_LANGUAGE", getattr(config, "RESPONSE_LANGUAGE", "auto"))
-        for i in range(self.response_lang_combo.count()):
-            if self.response_lang_combo.itemData(i) == current_lang:
-                self.response_lang_combo.setCurrentIndex(i)
-                break
-        lang_form.addRow("LLM response language:", self.response_lang_combo)
-        root.addWidget(lang_group)
-
-        # ── Buttons ───────────────────────────────────────────────────────
+        # ── Buttons ──
         btn_row = QHBoxLayout()
         save_btn = QPushButton("💾 Save")
         cancel_btn = QPushButton("Cancel")
@@ -162,17 +183,44 @@ class SettingsUI(QDialog):
         btn_row.addWidget(save_btn)
         root.addLayout(btn_row)
 
-    # ── Helpers ───────────────────────────────────────────────────────────
+    # ── Field builders ───────────────────────────────────────────────────
 
-    def _plain_field(self, key: str, fallback: str) -> QLineEdit:
+    def _add_text(self, key: str, fallback: str) -> QLineEdit:
         field = QLineEdit()
         field.setText(self.saved_config.get(key, fallback))
+        self._fields[key] = ("text", field)
         return field
 
-    def _secret_field(self, key: str, fallback: str) -> QLineEdit:
-        field = self._plain_field(key, fallback)
+    def _add_secret(self, key: str, fallback: str) -> QLineEdit:
+        field = QLineEdit()
+        field.setText(self.saved_config.get(key, fallback))
         field.setEchoMode(QLineEdit.EchoMode.Password)
+        # Show/hide eye action (issue #20)
+        action = QAction("👁", field)
+        action.setToolTip("Show / hide")
+        action.setCheckable(True)
+
+        def _toggle(checked: bool) -> None:
+            field.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password)
+            action.setText("🙈" if checked else "👁")
+
+        action.toggled.connect(_toggle)
+        field.addAction(action, QLineEdit.ActionPosition.TrailingPosition)
+        self._fields[key] = ("secret", field)
         return field
+
+    def _add_combo(self, key: str, current: str, options: list[tuple[str, str]]) -> QComboBox:
+        combo = QComboBox()
+        for label, code in options:
+            combo.addItem(label, code)
+        for i, (_, code) in enumerate(options):
+            if code == current:
+                combo.setCurrentIndex(i)
+                break
+        self._fields[key] = ("combo", combo)
+        return combo
+
+    # ── Persistence ──────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
         if os.path.exists(CONFIG_FILE):
@@ -183,23 +231,24 @@ class SettingsUI(QDialog):
                 logger.error(f"Failed to load config.json: {e}")
         return {}
 
+    def _collect(self) -> dict:
+        out: dict = {}
+        for key, (kind, widget) in self._fields.items():
+            if kind == "combo":
+                out[key] = widget.currentData()
+            else:
+                out[key] = widget.text().strip()
+        return out
+
     def _save(self):
-        new_cfg = {
-            "AZURE_SPEECH_KEY": self.azure_key_input.text().strip(),
-            "AZURE_SPEECH_REGION": self.azure_region_input.text().strip(),
-            "ASR_LANGUAGE": self.asr_language_combo.currentData(),
-            "OPENAI_API_KEY": self.openai_key_input.text().strip(),
-            "DEEPSEEK_API_KEY": self.deepseek_key_input.text().strip(),
-            "TEXT_MODEL": self.text_model_input.text().strip(),
-            "VISION_MODEL": self.vision_model_input.text().strip(),
-            "SCREENSHOT_HOTKEY": self.screenshot_hk_input.text().strip(),
-            "INTERACTION_HOTKEY": self.interaction_hk_input.text().strip(),
-            "RESPONSE_LANGUAGE": self.response_lang_combo.currentData(),
-        }
+        new_cfg = self._collect()
+        # Preserve non-form values (e.g. geometry persisted by overlays).
+        existing = self._load_config()
+        existing.update(new_cfg)
 
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(new_cfg, f, indent=4, ensure_ascii=False)
+                json.dump(existing, f, indent=4, ensure_ascii=False)
 
             # Hot-patch the in-memory config
             for k, v in new_cfg.items():

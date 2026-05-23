@@ -1,8 +1,23 @@
 import logging
+import sys
 from pathlib import Path
 from typing import Iterable
 
 logger = logging.getLogger(__name__)
+
+# When frozen by PyInstaller, bundled resources live under sys._MEIPASS.
+# In dev, fall back to the repo root (one level up from src/).
+_BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+
+
+def _resolve_root(root_dir: str) -> Path:
+    """Try the path as-is, then relative to the bundle/repo base."""
+    p = Path(root_dir)
+    if p.is_absolute() and p.exists():
+        return p
+    if p.exists():
+        return p
+    return _BASE_DIR / root_dir
 
 
 def _iter_files(root: Path, patterns: list[str]) -> Iterable[Path]:
@@ -60,7 +75,7 @@ def load_knowledge_dir(
     - Adds a short source header per chunk for traceability
     """
     patterns = patterns or ["*.md", "*.txt"]
-    root = Path(root_dir)
+    root = _resolve_root(root_dir)
     if not root.exists():
         logger.warning(f"Knowledge dir not found: {root.resolve()}")
         return []
