@@ -68,6 +68,9 @@ class Config:
     VISION_PROVIDER = os.getenv("VISION_PROVIDER", "")
     # Ollama (local OpenAI-compatible endpoint).
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    # Multi-turn context: number of prior (Q, A) pairs to feed back to the
+    # text model. 0 disables history (default — keeps token usage tight).
+    CONTEXT_TURNS = _env_int("CONTEXT_TURNS", 0)
 
     # Audio Settings
     SAMPLE_RATE = 16000

@@ -207,6 +207,7 @@ async def run_pipelines(app, loop):
         on_settings_saved=on_settings_saved,
         max_conversation_blocks=getattr(config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3),
         on_stop=lambda: llm_engine.cancel("text"),
+        on_clear=llm_engine.clear_history,
     )
     ui_vision = OverlayUI(
         title="GhostPilot · Vision",

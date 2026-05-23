@@ -276,6 +276,7 @@ class OverlayUI(QMainWindow):
         geometry_key: str = "OVERLAY_ASR_GEOMETRY",
         hotkey_hint: str | None = None,
         on_stop=None,
+        on_clear=None,
     ):
         super().__init__()
         self.is_interactive = True   # toggled by Alt+A
@@ -287,6 +288,7 @@ class OverlayUI(QMainWindow):
         self._accent = accent
         self._on_settings_saved = on_settings_saved
         self._on_stop = on_stop
+        self._on_clear = on_clear
         self._geometry_key = geometry_key
         self._hotkey_hint = hotkey_hint
         self._status_flash_timer: Optional[QTimer] = None
@@ -544,6 +546,11 @@ class OverlayUI(QMainWindow):
         self._full_text = ""
         self._content.clear()
         self._header.clear_badge()
+        if self._on_clear is not None:
+            try:
+                self._on_clear()
+            except Exception:
+                pass
 
     def copy_last_block(self):
         """Copy the most recent Q/A block to the clipboard."""

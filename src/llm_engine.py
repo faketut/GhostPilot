@@ -127,6 +127,15 @@ class LLMEngine:
         self._init_clients()
         # Track in-flight streaming tasks so a UI Stop button / Esc can cancel them.
         self._active_tasks: dict[str, asyncio.Task] = {}
+        # Multi-turn conversation history (Phase 2.2). Each entry is a (q, a) pair
+        # of plain strings. Trimmed to CONTEXT_TURNS on insert.
+        from collections import deque
+        n = int(getattr(config, "CONTEXT_TURNS", 0) or 0)
+        self._text_history: deque = deque(maxlen=max(n, 0))
+
+    def clear_history(self) -> None:
+        """Drop multi-turn conversation history (called from UI Clear button)."""
+        self._text_history.clear()
 
     def register_task(self, kind: str, task: asyncio.Task) -> None:
         """Register a running stream task under 'text' | 'vision' so it can be cancelled."""
@@ -182,6 +191,12 @@ class LLMEngine:
         Safe to call between requests; in-flight requests keep using old clients.
         """
         self._init_clients()
+        # Resize history deque if CONTEXT_TURNS changed.
+        from collections import deque
+        n = int(getattr(config, "CONTEXT_TURNS", 0) or 0)
+        if n != (self._text_history.maxlen or 0):
+            old = list(self._text_history)
+            self._text_history = deque(old[-n:] if n else [], maxlen=max(n, 0))
 
     def _rag_min_score(self) -> float:
         return float(getattr(config, "RAG_MIN_SCORE", 0.32))
@@ -313,7 +328,15 @@ class LLMEngine:
             algo_blob,
             vision_mode=False,
         )
+        # Insert prior turns between system and the new user message.
+        if self._text_history.maxlen and len(self._text_history) > 0:
+            history_msgs: list[dict] = []
+            for q, a in self._text_history:
+                history_msgs.append({"role": "user", "content": q})
+                history_msgs.append({"role": "assistant", "content": a})
+            messages = [messages[0], *history_msgs, messages[1]]
 
+        full_answer_parts: list[str] = []
         try:
             agen = self.text_provider.chat_stream(
                 messages,
@@ -323,6 +346,7 @@ class LLMEngine:
             )
             async for delta in agen:
                 if delta.text:
+                    full_answer_parts.append(delta.text)
                     await ui_queue.put({"type": "token", "text": delta.text})
                 if delta.usage:
                     self.last_usage["text"] = delta.usage
@@ -338,6 +362,12 @@ class LLMEngine:
         except Exception as e:
             logger.error("LLM text error: %s", e)
             await ui_queue.put({"type": "token", "text": f"\n[⚠️ {e}]"})
+        else:
+            # Only record successful completions in history.
+            if self._text_history.maxlen:
+                answer = "".join(full_answer_parts).strip()
+                if answer:
+                    self._text_history.append((question, answer))
 
     @staticmethod
     def _compress_jpeg(image_bytes: bytes) -> bytes:
