@@ -14,15 +14,29 @@ If a file is missing, a sensible inline fallback is used so the app never crashe
 """
 
 import logging
+import os
 import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # When frozen by PyInstaller, bundled data lives under sys._MEIPASS; otherwise
-# use the repo root (two levels up from this file).
+# use the repo root (two levels up from this file). User edits always go to a
+# writable per-user dir and shadow the bundled defaults at read time.
 _BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
 _PROMPT_DIR = _BASE_DIR / "prompts"
+
+
+def _user_prompt_dir() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "GhostPilot" / "prompts"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "GhostPilot" / "prompts"
+    return Path.home() / ".config" / "GhostPilot" / "prompts"
+
+
+_USER_PROMPT_DIR = _user_prompt_dir()
 
 # ── Inline fallbacks (used when .md file is absent) ──────────────────────
 _FALLBACKS: dict[str, str] = {
@@ -53,19 +67,20 @@ _cache: dict[str, str] = {}
 
 
 def _load(q_type: str) -> str:
-    """Load and cache a single prompt file."""
+    """Load and cache a single prompt file. User overrides take precedence."""
     if q_type in _cache:
         return _cache[q_type]
 
-    path = _PROMPT_DIR / f"{q_type}.md"
-    if path.exists():
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-            _cache[q_type] = text
-            logger.info(f"Loaded prompt: {path.name} ({len(text)} chars)")
-            return text
-        except Exception as e:
-            logger.warning(f"Failed to read {path}: {e} — using fallback")
+    # 1) user override (writable), 2) bundled default, 3) inline fallback.
+    for path in (_USER_PROMPT_DIR / f"{q_type}.md", _PROMPT_DIR / f"{q_type}.md"):
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+                _cache[q_type] = text
+                logger.info(f"Loaded prompt: {path} ({len(text)} chars)")
+                return text
+            except Exception as e:
+                logger.warning(f"Failed to read {path}: {e}")
 
     fallback = _FALLBACKS.get(q_type, "You are a helpful interview assistant.")
     _cache[q_type] = fallback
@@ -84,7 +99,10 @@ def list_prompts() -> list[str]:
 
 
 def prompt_path(q_type: str) -> Path:
-    """Filesystem path where `q_type`'s prompt would live."""
+    """Effective filesystem path: user override if present, else bundled."""
+    user = _USER_PROMPT_DIR / f"{q_type}.md"
+    if user.exists():
+        return user
     return _PROMPT_DIR / f"{q_type}.md"
 
 
@@ -99,12 +117,16 @@ def reload(q_type: str) -> str:
 
 
 def save(q_type: str, text: str) -> Path:
-    """Write `text` to the prompt file and refresh the cache. Returns the path."""
-    path = prompt_path(q_type)
+    """Write `text` to the user prompt dir and refresh the cache.
+
+    Always writes to the per-user dir (which is writable even in PyInstaller
+    frozen mode where ``sys._MEIPASS`` is a temp extraction that gets wiped).
+    """
+    path = _USER_PROMPT_DIR / f"{q_type}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     _cache[q_type] = text.strip()
-    logger.info(f"Saved prompt: {path.name} ({len(text)} chars)")
+    logger.info(f"Saved prompt: {path} ({len(text)} chars)")
     return path
 
 
