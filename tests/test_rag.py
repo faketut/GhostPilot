@@ -18,6 +18,7 @@ def test_kb_relpath_parse():
 
 def test_rrf_combines():
     rm = RAGManager.__new__(RAGManager)  # bypass __init__
-    fused = rm._rrf([1, 2, 3], [3, 2, 1])
+    # 2 is rank-1 in the first list and rank-1 in the second → unambiguous winner.
+    fused = rm._rrf([2, 1, 3], [2, 3, 1])
     assert set(fused) == {1, 2, 3}
-    assert fused[0] == 2  # 2 is mid-rank in both → highest combined
+    assert fused[0] == 2

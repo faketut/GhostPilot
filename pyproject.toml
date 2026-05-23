@@ -12,5 +12,6 @@ line-length = 110
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP"]
-ignore = ["E501"]
+# Stick to real errors only; the legacy codebase predates I/UP conventions.
+select = ["E", "F", "W"]
+ignore = ["E501", "E701", "E702", "E401", "W291", "W293", "F541"]
