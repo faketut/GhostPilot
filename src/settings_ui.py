@@ -21,12 +21,29 @@ from PyQt6.QtGui import QAction
 
 from src.config import config
 from src import theme
+from src import icons
 from src import settings_tests
 from src import prompt_loader
 
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = "config.json"
+
+
+def _set_btn_icon_or_text(btn, icon_name: str, *, keep_text: bool = False) -> None:
+    """Set an icon on the button if qtawesome is available; else fall back to emoji text.
+
+    keep_text=True preserves the button's existing text (icon shown beside it).
+    keep_text=False (default) means the button has no text — fall back is to set
+    the emoji as the button's text.
+    """
+    ic = icons.icon(icon_name, color=theme.palette()["text_dim"])
+    if not ic.isNull():
+        btn.setIcon(ic)
+        from PyQt6.QtCore import QSize
+        btn.setIconSize(QSize(14, 14))
+    elif not keep_text:
+        btn.setText(icons.emoji_fallback(icon_name))
 
 
 def _dark_stylesheet() -> str:
@@ -171,7 +188,7 @@ class SettingsUI(QDialog):
             getattr(config, "ASR_BACKEND", "azure"),
             _ASR_BACKEND_OPTIONS,
         ))
-        tabs.addTab(azure_w, "🎙️ Azure")
+        tabs.addTab(azure_w, icons.icon("microphone"), "Azure")
 
         # ── Tab: LLM ──
         llm = QFormLayout()
@@ -199,7 +216,8 @@ class SettingsUI(QDialog):
         # ── Ollama (local) ──
         ollama_row = QHBoxLayout()
         ollama_field = self._add_text("OLLAMA_BASE_URL", getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434/v1"))
-        ollama_btn = QToolButton(); ollama_btn.setText("🔍"); ollama_btn.setToolTip("Detect running Ollama instance")
+        ollama_btn = QToolButton(); ollama_btn.setToolTip("Detect running Ollama instance")
+        _set_btn_icon_or_text(ollama_btn, "search")
         ollama_status = QLabel(""); ollama_status.setMinimumWidth(140)
         def _detect_ollama():
             import urllib.request, json as _json
@@ -226,7 +244,8 @@ class SettingsUI(QDialog):
 
         # ── Master test (selected text + vision providers) ──
         test_row = QHBoxLayout()
-        test_btn = QPushButton("🧪 Test selected providers")
+        test_btn = QPushButton("Test selected providers")
+        _set_btn_icon_or_text(test_btn, "test", keep_text=True)
         test_status = QLabel("")
         test_status.setStyleSheet("color:#9aa; font-size:11px;")
         test_row.addWidget(test_btn); test_row.addWidget(test_status, 1)
@@ -269,7 +288,7 @@ class SettingsUI(QDialog):
         test_btn.clicked.connect(_run_master_test)
         test_w = QWidget(); test_w.setLayout(test_row)
         llm.addRow("", test_w)
-        tabs.addTab(llm_w, "🤖 LLM")
+        tabs.addTab(llm_w, icons.icon("robot"), "LLM")
 
         # ── Tab: Hotkeys (issue #4) ──
         hk = QFormLayout()
@@ -283,7 +302,7 @@ class SettingsUI(QDialog):
         hk.addRow("Force stealth (primary):",    self._add_text("FORCE_STEALTH_HOTKEY", config.FORCE_STEALTH_HOTKEY))
         hk.addRow("Force stealth (backup):",     self._add_text("FORCE_STEALTH_HOTKEY_BACKUP", config.FORCE_STEALTH_HOTKEY_BACKUP))
         hk.addRow("Both overlays (alias):",      self._add_text("INTERACTION_HOTKEY", config.INTERACTION_HOTKEY))
-        tabs.addTab(hk_w, "⌨️ Hotkeys")
+        tabs.addTab(hk_w, icons.icon("keyboard"), "Hotkeys")
 
         # ── Tab: Language ──
         lang = QFormLayout()
@@ -294,10 +313,10 @@ class SettingsUI(QDialog):
             getattr(config, "RESPONSE_LANGUAGE", "auto"),
             _RESPONSE_LANG_OPTIONS,
         ))
-        tabs.addTab(lang_w, "🌐 Language")
+        tabs.addTab(lang_w, icons.icon("language"), "Language")
 
         # ── Tab: Prompts (issue #10 in plan) ──
-        tabs.addTab(self._build_prompts_tab(), "📝 Prompts")
+        tabs.addTab(self._build_prompts_tab(), icons.icon("edit"), "Prompts")
 
         root.addWidget(tabs, 1)
 
@@ -307,7 +326,8 @@ class SettingsUI(QDialog):
 
         # ── Buttons ──
         btn_row = QHBoxLayout()
-        save_btn = QPushButton("💾 Save")
+        save_btn = QPushButton("Save")
+        _set_btn_icon_or_text(save_btn, "save", keep_text=True)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("cancelBtn")
         save_btn.clicked.connect(self._save)
@@ -412,12 +432,14 @@ class SettingsUI(QDialog):
         self._prompt_status = QLabel("")
         self._prompt_status.setStyleSheet("color:#9aa; font-size:11px;")
         btn_row.addWidget(self._prompt_status, 1)
-        rebuild_kb_btn = QPushButton("🔄 Rebuild KB")
+        rebuild_kb_btn = QPushButton("Rebuild KB")
+        _set_btn_icon_or_text(rebuild_kb_btn, "refresh", keep_text=True)
         rebuild_kb_btn.setToolTip("Re-read the knowledge/ directory into the RAG index")
         rebuild_kb_btn.setEnabled(self._on_rebuild_kb is not None)
         rebuild_kb_btn.clicked.connect(self._on_rebuild_kb_clicked)
         restore_btn = QPushButton("Restore default")
-        save_prompt_btn = QPushButton("💾 Save prompt")
+        save_prompt_btn = QPushButton("Save prompt")
+        _set_btn_icon_or_text(save_prompt_btn, "save", keep_text=True)
         restore_btn.clicked.connect(self._on_prompt_restore)
         save_prompt_btn.clicked.connect(self._on_prompt_save)
         btn_row.addWidget(rebuild_kb_btn)
@@ -529,7 +551,7 @@ class SettingsUI(QDialog):
         h.addWidget(field, 1)
 
         btn = QToolButton()
-        btn.setText("🧪")
+        _set_btn_icon_or_text(btn, "test")
         btn.setToolTip(f"Test {provider} connection")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         h.addWidget(btn)

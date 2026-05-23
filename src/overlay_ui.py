@@ -34,6 +34,7 @@ from src.windows_api import enable_window_stealth, set_window_interaction_mode, 
 from src.config import config
 from src.settings_ui import SettingsUI
 from src import theme
+from src import icons
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +61,10 @@ _STICKY_BOTTOM_TOLERANCE_PX = 4
 
 # Badge colours per question type (label + base hex; alpha applied at runtime)
 _BADGE = {
-    "behavioral": ("#d97706", "🎯 Behavioral"),
-    "algorithm":  ("#2563eb", "💻 Algorithm"),
-    "technical":  ("#7c3aed", "📖 Technical"),
-    "vision":     ("#065f46", "📸 Vision"),
+    "behavioral": ("#d97706", "Behavioral"),
+    "algorithm":  ("#2563eb", "Algorithm"),
+    "technical":  ("#7c3aed", "Technical"),
+    "vision":     ("#065f46", "Vision"),
 }
 
 
@@ -144,23 +145,29 @@ class _DragHeader(QWidget):
         self._type_badge.hide()
         layout.addWidget(self._type_badge)
 
-        def _tb(text: str, tip: str, slot) -> QToolButton:
+        def _tb(icon_name: str, tip: str, slot) -> QToolButton:
             b = QToolButton(self)
-            b.setText(text)
             b.setToolTip(tip)
             b.setAutoRaise(True)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setFixedSize(22, 22)
             b.clicked.connect(slot)
+            ic = icons.icon(icon_name, color=theme.palette()["text_dim"])
+            if not ic.isNull():
+                b.setIcon(ic)
+                from PyQt6.QtCore import QSize
+                b.setIconSize(QSize(14, 14))
+            else:
+                b.setText(icons.emoji_fallback(icon_name))
             return b
 
-        # Header controls: lock state · stop · clear · copy
-        self._lock_btn = _tb("👻", "Click-through (Alt+A to toggle)", on_toggle_interaction)
-        self._stop_btn = _tb("⏹", "Stop generation (Esc)", on_stop or (lambda: None))
+        # Header controls: lock state · stop · clear · copy · export
+        self._lock_btn = _tb("ghost", "Click-through (Alt+A to toggle)", on_toggle_interaction)
+        self._stop_btn = _tb("stop", "Stop generation (Esc)", on_stop or (lambda: None))
         self._stop_btn.setVisible(False)
-        self._clear_btn = _tb("🧹", "Clear", on_clear)
-        self._copy_btn = _tb("📋", "Copy last answer", on_copy)
-        self._export_btn = _tb("💾", "Export conversation to ~/Documents/GhostPilot", on_export or (lambda: None))
+        self._clear_btn = _tb("clear", "Clear", on_clear)
+        self._copy_btn = _tb("copy", "Copy last answer", on_copy)
+        self._export_btn = _tb("save", "Export conversation to ~/Documents/GhostPilot", on_export or (lambda: None))
         layout.addWidget(self._lock_btn)
         layout.addWidget(self._stop_btn)
         layout.addWidget(self._clear_btn)
@@ -192,10 +199,18 @@ class _DragHeader(QWidget):
 
     def set_lock_state(self, interactive: bool) -> None:
         if interactive:
-            self._lock_btn.setText("🖱️")
+            ic = icons.icon("cursor", color=theme.palette()["text_dim"])
+            if not ic.isNull():
+                self._lock_btn.setIcon(ic)
+            else:
+                self._lock_btn.setText(icons.emoji_fallback("cursor"))
             self._lock_btn.setToolTip("Interactive (Alt+A to lock)")
         else:
-            self._lock_btn.setText("👻")
+            ic = icons.icon("ghost", color=theme.palette()["text_dim"])
+            if not ic.isNull():
+                self._lock_btn.setIcon(ic)
+            else:
+                self._lock_btn.setText(icons.emoji_fallback("ghost"))
             self._lock_btn.setToolTip("Click-through (Alt+A to toggle)")
 
     def set_question_type(self, q_type: str):
@@ -504,11 +519,17 @@ class OverlayUI(QMainWindow):
         tray = QSystemTrayIcon(QIcon(px), self)
         tray.setToolTip("GhostPilot Copilot")
         menu = QMenu()
-        menu.addAction("⚙️ Settings", self._open_settings)
+        settings_act = menu.addAction("Settings", self._open_settings)
+        ic_settings = icons.icon("settings")
+        if not ic_settings.isNull():
+            settings_act.setIcon(ic_settings)
         menu.addSeparator()
-        self._record_action = menu.addAction("🔴 Start recording", self._toggle_recording)
+        self._record_action = menu.addAction("Start recording", self._toggle_recording)
+        ic_rec = icons.icon("record", color="#d32f2f")
+        if not ic_rec.isNull():
+            self._record_action.setIcon(ic_rec)
         menu.addSeparator()
-        menu.addAction("❌ Quit", QApplication.instance().quit)
+        menu.addAction("Quit", QApplication.instance().quit)
         tray.setContextMenu(menu)
         tray.show()
         self._tray = tray
@@ -517,13 +538,19 @@ class OverlayUI(QMainWindow):
         from src.session_recorder import recorder
         if recorder.is_recording():
             out = recorder.stop()
-            self._record_action.setText("🔴 Start recording")
+            self._record_action.setText("Start recording")
+            ic = icons.icon("record", color="#d32f2f")
+            if not ic.isNull():
+                self._record_action.setIcon(ic)
             self._flash_bottom_status(f"Recording saved: {out.name if out else '?'}", duration_ms=2500)
         else:
             d = recorder.start()
             if d:
-                self._record_action.setText("⏹ Stop recording")
-                self._flash_bottom_status("● Recording…", duration_ms=1500)
+                self._record_action.setText("Stop recording")
+                ic = icons.icon("stop")
+                if not ic.isNull():
+                    self._record_action.setIcon(ic)
+                self._flash_bottom_status("Recording…", duration_ms=1500)
             else:
                 self._flash_bottom_status("Recording failed to start", duration_ms=2000)
 
@@ -545,7 +572,7 @@ class OverlayUI(QMainWindow):
         if self._on_stop is not None:
             try:
                 self._on_stop()
-                self._flash_bottom_status("⏹ Stopping…", duration_ms=900)
+                self._flash_bottom_status("Stopping…", duration_ms=900)
             except Exception as e:
                 logger.warning(f"Stop callback failed: {e}")
 
@@ -769,7 +796,7 @@ class OverlayUI(QMainWindow):
         self.is_interactive = not self.is_interactive
         if sys.platform == "win32":
             set_window_interaction_mode(int(self.winId()), self.is_interactive)
-        mode = "🖱️ Interactive" if self.is_interactive else "👻 Click-through"
+        mode = "Interactive" if self.is_interactive else "Click-through"
         logger.info(f"Interaction mode → {mode}")
         self._header.set_lock_state(self.is_interactive)
         self._flash_bottom_status(f"Switched to {mode}")
@@ -778,7 +805,7 @@ class OverlayUI(QMainWindow):
         self.is_interactive = bool(interactive)
         if sys.platform == "win32":
             set_window_interaction_mode(int(self.winId()), self.is_interactive)
-        mode = "🖱️ Interactive" if self.is_interactive else "👻 Click-through"
+        mode = "Interactive" if self.is_interactive else "Click-through"
         logger.info(f"Interaction mode → {mode}")
         self._header.set_lock_state(self.is_interactive)
         self._flash_bottom_status(f"Switched to {mode}")

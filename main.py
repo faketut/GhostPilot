@@ -268,7 +268,7 @@ async def run_pipelines(app, loop):
         title="GhostPilot · ASR",
         with_tray=True,
         start_y=20,
-        accent="🎙️ ASR",
+        accent="ASR",
         on_settings_saved=on_settings_saved,
         max_conversation_blocks=getattr(config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3),
         on_stop=lambda: llm_engine.cancel("text"),
@@ -279,7 +279,7 @@ async def run_pipelines(app, loop):
         title="GhostPilot · Vision",
         with_tray=False,
         start_y=310,
-        accent="📸 Vision",
+        accent="Vision",
         on_settings_saved=on_settings_saved,
         on_stop=lambda: llm_engine.cancel("vision"),
     )

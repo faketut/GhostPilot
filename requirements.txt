@@ -1,5 +1,6 @@
 PyQt6>=6.6.0
 qasync>=0.27.1
+qtawesome>=1.3.0
 pyaudiowpatch>=0.2.12; sys_platform == "win32"
 sounddevice>=0.4.6; sys_platform != "win32"
 openai>=1.14.0
