@@ -293,6 +293,7 @@ class OverlayUI(QMainWindow):
         self._hotkey_hint = hotkey_hint
         self._status_flash_timer: Optional[QTimer] = None
         self._geom_save_timer: Optional[QTimer] = None
+        self._usage_text: str = ""
         self._initUI()
         theme.on_changed(self._on_theme_changed)
 
@@ -448,10 +449,18 @@ class OverlayUI(QMainWindow):
         ]
         if self._hotkey_hint:
             bits.insert(0, self._hotkey_hint)
-        return "  ·  ".join(bits)
+        text = "  ·  ".join(bits)
+        if self._usage_text:
+            text = f"{text}    │   {self._usage_text}"
+        return text
 
     def refresh_footer(self) -> None:
         self._footer.setText(self._build_footer_text())
+
+    def set_usage_footer(self, text: str) -> None:
+        """Display a token / cost suffix in the footer (Phase 2.3)."""
+        self._usage_text = text or ""
+        self.refresh_footer()
 
     def _apply_initial_geometry(self) -> None:
         saved = getattr(config, self._geometry_key, None)

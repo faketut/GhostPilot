@@ -47,6 +47,18 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
                 ui.update_text(msg["text"], append=True)
             elif msg["type"] == "clear":
                 ui.update_text("", append=False)
+            elif msg["type"] == "usage":
+                # Token / cost footer (Phase 2.3)
+                try:
+                    from src.llm.pricing import cost_usd, format_cost
+                    c = cost_usd(msg.get("model", ""), msg.get("in", 0), msg.get("out", 0))
+                    parts = [f"↑{msg.get('in', 0)}", f"↓{msg.get('out', 0)}"]
+                    cs = format_cost(c)
+                    if cs:
+                        parts.append(cs)
+                    ui.set_usage_footer(" · ".join(parts))
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             break
         except Exception as e:
