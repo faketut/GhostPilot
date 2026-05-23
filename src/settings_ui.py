@@ -143,6 +143,8 @@ class SettingsUI(QDialog):
             logger.warning(f"keyring read for SettingsUI failed: {e}")
         # Maps config key → (kind, widget). Saved/loaded generically.
         self._fields: dict[str, tuple[str, QWidget]] = {}
+        # (layout, row_index, config_key) for rows that auto-hide by provider.
+        self._scoped_rows: list[tuple[QFormLayout, int, str]] = []
 
         root = QVBoxLayout(self)
         root.setSpacing(12)
@@ -155,9 +157,13 @@ class SettingsUI(QDialog):
         azure_w = QWidget()
         azure_w.setLayout(azure)
         azure.addRow("Subscription key:",   self._add_secret("AZURE_SPEECH_KEY", config.AZURE_SPEECH_KEY, test="azure"))
+        self._track_scoped(azure, "AZURE_SPEECH_KEY")
         azure.addRow("Region (e.g. eastus):", self._add_text("AZURE_SPEECH_REGION", config.AZURE_SPEECH_REGION))
+        self._track_scoped(azure, "AZURE_SPEECH_REGION")
         azure.addRow("Custom endpoint (optional):", self._add_text("AZURE_SPEECH_ENDPOINT", config.AZURE_SPEECH_ENDPOINT))
+        self._track_scoped(azure, "AZURE_SPEECH_ENDPOINT")
         azure.addRow("ASR language:", self._add_combo("ASR_LANGUAGE", config.ASR_LANGUAGE, _ASR_LANG_OPTIONS))
+        self._track_scoped(azure, "ASR_LANGUAGE")
         azure.addRow("ASR backend:", self._add_combo(
             "ASR_BACKEND",
             getattr(config, "ASR_BACKEND", "azure"),
@@ -170,8 +176,11 @@ class SettingsUI(QDialog):
         llm_w = QWidget()
         llm_w.setLayout(llm)
         llm.addRow("OpenAI API key:",   self._add_secret("OPENAI_API_KEY", config.OPENAI_API_KEY, test="openai"))
+        self._track_scoped(llm, "OPENAI_API_KEY")
         llm.addRow("DeepSeek API key:", self._add_secret("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY, test="deepseek"))
+        self._track_scoped(llm, "DEEPSEEK_API_KEY")
         llm.addRow("Gemini API key:",   self._add_secret("GEMINI_API_KEY", config.GEMINI_API_KEY, test="gemini"))
+        self._track_scoped(llm, "GEMINI_API_KEY")
         llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
         llm.addRow("Text provider:",    self._add_combo("TEXT_PROVIDER", getattr(config, "TEXT_PROVIDER", ""), _TEXT_PROVIDER_OPTIONS))
         llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
@@ -203,6 +212,7 @@ class SettingsUI(QDialog):
         ollama_row.addWidget(ollama_field, 1); ollama_row.addWidget(ollama_btn); ollama_row.addWidget(ollama_status)
         ollama_w = QWidget(); ollama_w.setLayout(ollama_row)
         llm.addRow("Ollama base URL:", ollama_w)
+        self._track_scoped(llm, "OLLAMA_BASE_URL")
 
         # ── Master test (selected text + vision providers) ──
         test_row = QHBoxLayout()
@@ -281,6 +291,10 @@ class SettingsUI(QDialog):
 
         root.addWidget(tabs, 1)
 
+        # ── Provider-scoped row visibility ──
+        self._wire_visibility()
+        self._refresh_visibility()
+
         # ── Buttons ──
         btn_row = QHBoxLayout()
         save_btn = QPushButton("💾 Save")
@@ -292,6 +306,78 @@ class SettingsUI(QDialog):
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(save_btn)
         root.addLayout(btn_row)
+
+    # ── Provider-scoped row visibility ───────────────────────────────────
+
+    def _track_scoped(self, layout: QFormLayout, key: str) -> None:
+        """Remember the row just added so it can be hidden when its provider is inactive."""
+        self._scoped_rows.append((layout, layout.rowCount() - 1, key))
+
+    def _wire_visibility(self) -> None:
+        # Recompute whenever the user changes any provider hint.
+        for key in ("TEXT_PROVIDER", "VISION_PROVIDER", "ASR_BACKEND"):
+            w = self._fields.get(key, (None, None))[1]
+            if isinstance(w, QComboBox):
+                w.currentIndexChanged.connect(lambda _i: self._refresh_visibility())
+        for key in ("TEXT_MODEL", "VISION_MODEL"):
+            w = self._fields.get(key, (None, None))[1]
+            if isinstance(w, QLineEdit):
+                w.textChanged.connect(lambda _t: self._refresh_visibility())
+
+    def _resolve_text_provider(self) -> str:
+        combo = self._fields.get("TEXT_PROVIDER", (None, None))[1]
+        v = (combo.currentData() if isinstance(combo, QComboBox) else "") or ""
+        v = v.strip().lower()
+        if v:
+            return v
+        m_field = self._fields.get("TEXT_MODEL", (None, None))[1]
+        m = (m_field.text() if isinstance(m_field, QLineEdit) else "").lower()
+        if m.startswith(("ollama/", "llama", "qwen", "mistral", "phi")):
+            return "ollama"
+        if "deepseek" in m:
+            return "deepseek"
+        if "gemini" in m:
+            return "gemini"
+        return "openai"
+
+    def _resolve_vision_provider(self) -> str:
+        combo = self._fields.get("VISION_PROVIDER", (None, None))[1]
+        v = (combo.currentData() if isinstance(combo, QComboBox) else "") or ""
+        v = v.strip().lower()
+        if v:
+            return v
+        m_field = self._fields.get("VISION_MODEL", (None, None))[1]
+        m = (m_field.text() if isinstance(m_field, QLineEdit) else "").lower()
+        if "gemini" in m:
+            return "gemini"
+        return "openai"
+
+    def _resolve_asr_backend(self) -> str:
+        combo = self._fields.get("ASR_BACKEND", (None, None))[1]
+        v = (combo.currentData() if isinstance(combo, QComboBox) else "") or "azure"
+        return v.strip().lower() or "azure"
+
+    def _refresh_visibility(self) -> None:
+        t = self._resolve_text_provider()
+        v = self._resolve_vision_provider()
+        a = self._resolve_asr_backend()
+        show = {
+            "OPENAI_API_KEY":      t == "openai" or v == "openai",
+            "DEEPSEEK_API_KEY":    t == "deepseek",
+            "GEMINI_API_KEY":      t == "gemini" or v == "gemini",
+            "OLLAMA_BASE_URL":     t == "ollama",
+            "AZURE_SPEECH_KEY":    a == "azure",
+            "AZURE_SPEECH_REGION": a == "azure",
+            "AZURE_SPEECH_ENDPOINT": a == "azure",
+            "ASR_LANGUAGE":        a == "azure",
+        }
+        for layout, row, key in self._scoped_rows:
+            if key in show:
+                try:
+                    layout.setRowVisible(row, show[key])
+                except AttributeError:
+                    # Qt < 6.4 fallback: leave visible.
+                    pass
 
     # ── Prompts tab ──────────────────────────────────────────────────────
 
