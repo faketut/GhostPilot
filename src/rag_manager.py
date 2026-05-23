@@ -12,6 +12,12 @@ except Exception as e:
     HAS_ST = False
     _ST_IMPORT_ERROR = e
 
+try:
+    from rank_bm25 import BM25Okapi
+    HAS_BM25 = True
+except Exception:
+    HAS_BM25 = False
+
 logger = logging.getLogger(__name__)
 
 _KB_HEADER = re.compile(r"^\[kb:([^]#]+)#\d+\]")
@@ -25,10 +31,15 @@ def kb_relpath_from_chunk(chunk: str) -> str | None:
 
 
 class RAGManager:
+    # Simple tokenizer for BM25: lower + word chars / CJK chars.
+    _TOK_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
+
     def __init__(self):
         self.documents = []
         self.embeddings = None
         self.model = None
+        self._bm25 = None
+        self._bm25_tokens: list[list[str]] = []
         if HAS_ST:
             logger.info("Loading sentence transformer model for RAG...")
             try:
@@ -43,6 +54,10 @@ class RAGManager:
             else:
                 logger.warning("sentence-transformers unavailable (RAG disabled).")
 
+    @classmethod
+    def _tokenize(cls, text: str) -> list[str]:
+        return [t.lower() for t in cls._TOK_RE.findall(text or "")]
+
     def load_documents(self, texts: list[str]):
         """Vectorizes and loads documents (Resume, JD) into memory."""
         self.documents = texts
@@ -51,6 +66,25 @@ class RAGManager:
             self.embeddings = self.model.encode(self.documents, convert_to_numpy=True)
             # Normalize embeddings for fast cosine similarity
             self.embeddings = self.embeddings / np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+        # BM25 index (independent of dense — works even without sentence_transformers).
+        if HAS_BM25 and texts:
+            self._bm25_tokens = [self._tokenize(t) for t in texts]
+            try:
+                self._bm25 = BM25Okapi(self._bm25_tokens)
+            except Exception as e:
+                logger.warning(f"BM25 init failed: {e}")
+                self._bm25 = None
+        else:
+            self._bm25 = None
+            self._bm25_tokens = []
+
+    def _rrf(self, *rankings: list[int], k: int = 60) -> list[int]:
+        """Reciprocal rank fusion: combine ranked id lists into a single ranking."""
+        scores: dict[int, float] = {}
+        for ranking in rankings:
+            for rank, doc_id in enumerate(ranking):
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+        return sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
 
     def search(
         self,
@@ -69,34 +103,55 @@ class RAGManager:
         if not self.documents:
             return []
 
+        # Dense ranking
+        dense_order: list[int] = []
+        dense_sims: np.ndarray | None = None
         if self.model and self.embeddings is not None:
             query_emb = self.model.encode([query], convert_to_numpy=True)
             query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
+            dense_sims = np.dot(self.embeddings, query_emb.T).flatten()
+            dense_order = list(np.argsort(dense_sims)[::-1][: top_k * 5])
 
-            similarities = np.dot(self.embeddings, query_emb.T).flatten()
-            order = np.argsort(similarities)[::-1]
+        # BM25 ranking
+        bm25_order: list[int] = []
+        if self._bm25 is not None:
+            try:
+                bm25_scores = self._bm25.get_scores(self._tokenize(query))
+                bm25_order = list(np.argsort(bm25_scores)[::-1][: top_k * 5])
+            except Exception as e:
+                logger.warning(f"BM25 query failed: {e}")
 
-            out: list[str] = []
-            for idx in order:
-                if len(out) >= top_k:
-                    break
-                sim = float(similarities[idx])
-                if sim < min_score:
+        # Combine
+        if dense_order and bm25_order:
+            fused = self._rrf(dense_order, bm25_order)
+            mode = "hybrid(dense+bm25)"
+        elif dense_order:
+            fused = dense_order
+            mode = "dense"
+        elif bm25_order:
+            fused = bm25_order
+            mode = "bm25"
+        else:
+            logger.info("RAG disabled; returning no context snippets.")
+            return []
+
+        out: list[str] = []
+        for idx in fused:
+            if len(out) >= top_k:
+                break
+            # min_score only applies when we have dense similarities.
+            if dense_sims is not None:
+                if float(dense_sims[int(idx)]) < min_score and idx not in bm25_order[:top_k]:
                     continue
-                doc = self.documents[int(idx)]
-                if source_filter is not None:
-                    rel = kb_relpath_from_chunk(doc) or ""
-                    if not source_filter(rel):
-                        continue
-                out.append(doc)
+            doc = self.documents[int(idx)]
+            if source_filter is not None:
+                rel = kb_relpath_from_chunk(doc) or ""
+                if not source_filter(rel):
+                    continue
+            out.append(doc)
 
-            logger.info(
-                "RAG search: %d snippets (min_score=%s, filter=%s)",
-                len(out),
-                min_score,
-                source_filter is not None,
-            )
-            return out
-
-        logger.info("RAG disabled; returning no context snippets.")
-        return []
+        logger.info(
+            "RAG search [%s]: %d snippets (min_score=%s, filter=%s)",
+            mode, len(out), min_score, source_filter is not None,
+        )
+        return out
