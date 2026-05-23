@@ -280,6 +280,7 @@ class OverlayUI(QMainWindow):
         hotkey_hint: str | None = None,
         on_stop=None,
         on_clear=None,
+        on_rebuild_kb=None,
     ):
         super().__init__()
         self.is_interactive = True   # toggled by Alt+A
@@ -292,11 +293,13 @@ class OverlayUI(QMainWindow):
         self._on_settings_saved = on_settings_saved
         self._on_stop = on_stop
         self._on_clear = on_clear
+        self._on_rebuild_kb = on_rebuild_kb
         self._geometry_key = geometry_key
         self._hotkey_hint = hotkey_hint
         self._status_flash_timer: Optional[QTimer] = None
         self._geom_save_timer: Optional[QTimer] = None
         self._usage_text: str = ""
+        self._info_text: str = ""
         self._initUI()
         theme.on_changed(self._on_theme_changed)
 
@@ -454,8 +457,13 @@ class OverlayUI(QMainWindow):
         if self._hotkey_hint:
             bits.insert(0, self._hotkey_hint)
         text = "  ·  ".join(bits)
+        suffix_bits = []
+        if self._info_text:
+            suffix_bits.append(self._info_text)
         if self._usage_text:
-            text = f"{text}    │   {self._usage_text}"
+            suffix_bits.append(self._usage_text)
+        if suffix_bits:
+            text = f"{text}    │   " + "  ·  ".join(suffix_bits)
         return text
 
     def refresh_footer(self) -> None:
@@ -464,6 +472,16 @@ class OverlayUI(QMainWindow):
     def set_usage_footer(self, text: str) -> None:
         """Display a token / cost suffix in the footer (Phase 2.3)."""
         self._usage_text = text or ""
+        self.refresh_footer()
+
+    def set_info_footer(self, provider: str = "", rag_hits: int | None = None) -> None:
+        """Display a small "provider · rag:N" status in the footer."""
+        parts = []
+        if provider:
+            parts.append(provider)
+        if rag_hits is not None:
+            parts.append(f"rag:{rag_hits}")
+        self._info_text = "  ·  ".join(parts)
         self.refresh_footer()
 
     def _apply_initial_geometry(self) -> None:
@@ -510,7 +528,7 @@ class OverlayUI(QMainWindow):
                 self._flash_bottom_status("Recording failed to start", duration_ms=2000)
 
     def _open_settings(self):
-        dlg = SettingsUI(self, on_saved=self._on_settings_saved)
+        dlg = SettingsUI(self, on_saved=self._on_settings_saved, on_rebuild_kb=self._on_rebuild_kb)
         dlg.exec()
 
     # ── Public API ────────────────────────────────────────────────────────

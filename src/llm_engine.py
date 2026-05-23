@@ -349,6 +349,16 @@ class LLMEngine:
         logger.info("[%s] %s", q_type.upper(), question)
 
         snippets, algo_blob = self._gather_context(q_type, question)
+        # Observability: notify UI of provider + RAG hit count before stream starts.
+        try:
+            rag_hits = len(snippets) + (1 if algo_blob else 0)
+            await ui_queue.put({
+                "type": "info",
+                "provider": getattr(self.text_provider, "name", "?"),
+                "rag_hits": rag_hits,
+            })
+        except Exception:
+            pass
         messages = self._build_interview_messages(
             q_type,
             question,
