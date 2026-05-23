@@ -132,10 +132,18 @@ class LLMEngine:
         from collections import deque
         n = int(getattr(config, "CONTEXT_TURNS", 0) or 0)
         self._text_history: deque = deque(maxlen=max(n, 0))
+        # Vision history (Phase 3.2): last N (timestamp, compressed_jpeg, question, answer).
+        vn = int(getattr(config, "VISION_HISTORY", 5) or 0)
+        self._vision_history: deque = deque(maxlen=max(vn, 0))
 
     def clear_history(self) -> None:
         """Drop multi-turn conversation history (called from UI Clear button)."""
         self._text_history.clear()
+        self._vision_history.clear()
+
+    def recent_vision(self) -> list[tuple]:
+        """Return a snapshot of recent vision turns: [(ts, image_bytes, q, a), ...]."""
+        return list(self._vision_history)
 
     async def preheat(self) -> None:
         """Fire-and-forget tiny request to warm the HTTPS pool. Throttled to once
@@ -606,6 +614,11 @@ class LLMEngine:
                 await self._vision_step_b_gemini(compressed, q_type, visible_question, ui_queue)
             else:
                 await self._vision_step_b_openai(compressed, q_type, visible_question, ui_queue)
+
+            # Record entry on successful completion (Phase 3.2).
+            if self._vision_history.maxlen:
+                import time
+                self._vision_history.append((time.time(), compressed, visible_question, ""))
 
         except asyncio.CancelledError:
             logger.info("Vision stream cancelled.")

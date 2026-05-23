@@ -71,6 +71,8 @@ class Config:
     # Multi-turn context: number of prior (Q, A) pairs to feed back to the
     # text model. 0 disables history (default — keeps token usage tight).
     CONTEXT_TURNS = _env_int("CONTEXT_TURNS", 0)
+    # Vision screenshot history retained for re-asking / future filmstrip UI.
+    VISION_HISTORY = _env_int("VISION_HISTORY", 5)
 
     # Audio Settings
     SAMPLE_RATE = 16000
