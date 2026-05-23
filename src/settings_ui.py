@@ -113,6 +113,10 @@ _VISION_PROVIDER_OPTIONS = [
     ("OpenAI", "openai"),
     ("Gemini", "gemini"),
 ]
+_ASR_BACKEND_OPTIONS = [
+    ("Azure Speech (cloud)", "azure"),
+    ("faster-whisper (local, offline)", "whisper"),
+]
 
 
 class SettingsUI(QDialog):
@@ -154,6 +158,11 @@ class SettingsUI(QDialog):
         azure.addRow("Region (e.g. eastus):", self._add_text("AZURE_SPEECH_REGION", config.AZURE_SPEECH_REGION))
         azure.addRow("Custom endpoint (optional):", self._add_text("AZURE_SPEECH_ENDPOINT", config.AZURE_SPEECH_ENDPOINT))
         azure.addRow("ASR language:", self._add_combo("ASR_LANGUAGE", config.ASR_LANGUAGE, _ASR_LANG_OPTIONS))
+        azure.addRow("ASR backend:", self._add_combo(
+            "ASR_BACKEND",
+            getattr(config, "ASR_BACKEND", "azure"),
+            _ASR_BACKEND_OPTIONS,
+        ))
         tabs.addTab(azure_w, "🎙️ Azure")
 
         # ── Tab: LLM ──
