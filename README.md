@@ -5,7 +5,7 @@ Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LL
 ## Features
 
 - Click-through stealth overlays (ASR + Vision) with synced hotkeys.
-- WASAPI loopback capture → Azure Speech streaming → segmenter → text LLM.
+- WASAPI loopback capture → **Azure Speech** *or* **local faster-whisper** → segmenter → text LLM.
 - Alt+P region screenshot → vision LLM (Gemini / OpenAI), independent pipeline.
 - Multi-provider text LLM: **OpenAI · DeepSeek · Ollama (local)** through one OpenAI-compatible adapter; **Gemini** via `google-genai`.
 - Hybrid RAG over `knowledge/` (BM25 + dense embeddings, RRF fused; embeddings load lazily).
@@ -67,7 +67,9 @@ All config can be set via:
 
 ### Required keys
 
-- **Azure ASR**: `SPEECH_KEY`, `SPEECH_REGION` (or `ENDPOINT`)
+- **ASR backend** (`ASR_BACKEND=azure` default, or `whisper` for offline):
+  - Azure: `SPEECH_KEY`, `SPEECH_REGION` (or `ENDPOINT`)
+  - Whisper: `pip install faster-whisper`, then tune `WHISPER_MODEL` (default `small`), `WHISPER_DEVICE` (`auto`/`cpu`/`cuda`), `WHISPER_COMPUTE_TYPE` (`int8` default), `WHISPER_WINDOW_SEC` (default `2.5`).
 - **Vision (Gemini default)**: `GEMINI_API_KEY`, `VISION_MODEL=gemini-...`
 - **Text LLM** (pick one): `OPENAI_API_KEY` *or* `DEEPSEEK_API_KEY` *or* a running Ollama server.
 
@@ -127,10 +129,11 @@ Both rankings are fused with Reciprocal Rank Fusion and the top matches are inje
 
 Open from the system tray (right-click → Settings) or the ⚙️ button on the ASR overlay. Tabs:
 
-- **🎙️ Azure** — Speech key / region / endpoint, ASR language
-- **🤖 LLM** — OpenAI / DeepSeek / Gemini keys, text & vision models
+- **🎙️ Azure** — Speech key / region / endpoint, ASR language, **ASR backend selector** (Azure ↔ Whisper)
+- **🤖 LLM** — OpenAI / DeepSeek / Gemini keys, text & vision models, **`TEXT_PROVIDER` / `VISION_PROVIDER` dropdowns**, and a 🧪 **Test selected providers** master button that runs text + vision health checks in parallel (incl. Ollama `/api/tags`)
 - **⌨️ Hotkeys** — all bindings (primary + backup)
 - **🌐 Language** — LLM response language (`auto` / `zh` / `en`)
+- **📝 Prompts** — edit system prompts (algorithm / behavioral / technical / vision); edits persist to a per-user dir (`%APPDATA%/GhostPilot/prompts` on Windows, `~/Library/Application Support/GhostPilot/prompts` on macOS, `~/.config/GhostPilot/prompts` on Linux) so they survive frozen-build upgrades
 
 Secret fields all have a 👁 show/hide toggle. Most changes apply immediately — no restart needed.
 
