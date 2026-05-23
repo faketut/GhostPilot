@@ -52,6 +52,30 @@ HIDDEN_IMPORTS = [
     "numpy",
     "sentence_transformers",
     "onnxruntime",
+    # LLM providers / SDKs
+    "openai",
+    "google.genai",
+    # RAG lexical index
+    "rank_bm25",
+    # Secret storage — bundle all platform backends; keyring picks one at runtime
+    "keyring",
+    "keyring.backends",
+    "keyring.backends.Windows",
+    "keyring.backends.macOS",
+    "keyring.backends.SecretService",
+    # Misc runtime deps
+    "keyboard",
+    "dotenv",
+    # Internal subpackages PyInstaller may miss when imported lazily
+    "src.llm",
+    "src.llm.base",
+    "src.llm.factory",
+    "src.llm.openai_compat",
+    "src.llm.gemini",
+    "src.llm.pricing",
+    "src.session_recorder",
+    "src.crash_logger",
+    "src.secret_store",
 ]
 
 # ── Helpers ────────────────────────────────────────────────────────────────
