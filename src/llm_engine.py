@@ -22,6 +22,7 @@ from PIL import Image
 from src.config import config
 from src.rag_manager import RAGManager
 from src.prompt_loader import get_prompt
+from src.llm import make_text_provider, make_vision_provider, Usage
 
 logger = logging.getLogger(__name__)
 
@@ -147,11 +148,17 @@ class LLMEngine:
         return n
 
     def _init_clients(self):
-        def _is_deepseek_model(model_name: str) -> bool:
-            return "deepseek" in (model_name or "").lower()
+        # New provider abstraction (Phase 2.1).
+        self.text_provider = make_text_provider()
+        self.vision_provider = make_vision_provider()
+        # Last observed usage per pipeline (consumed by Phase 2.3 token counter).
+        self.last_usage: dict[str, Usage] = {}
 
-        # Text LLM — DeepSeek-V3 by default (OpenAI-compatible API)
-        if _is_deepseek_model(config.TEXT_MODEL):
+        # ── Legacy clients kept for vision helpers (still call raw SDKs) ──
+        def _is_deepseek(m: str) -> bool:
+            return "deepseek" in (m or "").lower()
+
+        if _is_deepseek(config.TEXT_MODEL):
             self.text_client = AsyncOpenAI(
                 api_key=config.DEEPSEEK_API_KEY,
                 base_url="https://api.deepseek.com/v1",
@@ -159,16 +166,11 @@ class LLMEngine:
         else:
             self.text_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 
-        # Vision LLM — choose provider based on model name.
-        # DeepSeek vision models are rejected later in `generate_vision_answer_stream`
-        # (their /chat/completions does not accept image_url content blocks),
-        # so we only build a client for the providers we actually call.
         vm = (config.VISION_MODEL or "").lower()
         self.vision_client = None
-
         if vm.startswith("gemini"):
             self._vision_provider = "gemini"
-        elif _is_deepseek_model(config.VISION_MODEL):
+        elif _is_deepseek(config.VISION_MODEL):
             self._vision_provider = "deepseek"
         else:
             self._vision_provider = "openai_compatible"
@@ -190,16 +192,16 @@ class LLMEngine:
         if not q:
             return "technical"
         try:
-            resp = await self.text_client.chat.completions.create(
-                model=config.TEXT_MODEL,
-                messages=[
+            text = await self.text_provider.chat_complete(
+                [
                     {"role": "system", "content": _CLASSIFIER_SYSTEM},
                     {"role": "user", "content": q},
                 ],
+                model=config.TEXT_MODEL,
                 max_tokens=int(getattr(config, "CLASSIFIER_MAX_TOKENS", 64)),
                 temperature=float(getattr(config, "CLASSIFIER_TEMPERATURE", 0.1)),
             )
-            text = (resp.choices[0].message.content or "").strip()
+            text = (text or "").strip()
             data = _parse_json_object(text)
             t = _normalize_q_type(data.get("type"))
             if t:
@@ -312,19 +314,22 @@ class LLMEngine:
             vision_mode=False,
         )
 
-        stream = None
         try:
-            stream = await self.text_client.chat.completions.create(
+            agen = self.text_provider.chat_stream(
+                messages,
                 model=config.TEXT_MODEL,
-                messages=messages,
-                stream=True,
                 max_tokens=450,
                 temperature=0.25,
             )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta is not None:
-                    await ui_queue.put({"type": "token", "text": delta})
+            async for delta in agen:
+                if delta.text:
+                    await ui_queue.put({"type": "token", "text": delta.text})
+                if delta.usage:
+                    self.last_usage["text"] = delta.usage
+                    await ui_queue.put({"type": "usage", "kind": "text",
+                                        "in": delta.usage.in_tokens,
+                                        "out": delta.usage.out_tokens,
+                                        "model": config.TEXT_MODEL})
 
         except asyncio.CancelledError:
             logger.info("Text stream cancelled.")
@@ -333,12 +338,6 @@ class LLMEngine:
         except Exception as e:
             logger.error("LLM text error: %s", e)
             await ui_queue.put({"type": "token", "text": f"\n[⚠️ {e}]"})
-        finally:
-            if stream is not None:
-                try:
-                    await stream.close()
-                except Exception:
-                    pass
 
     @staticmethod
     def _compress_jpeg(image_bytes: bytes) -> bytes:

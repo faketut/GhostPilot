@@ -62,6 +62,13 @@ class Config:
     # NOTE: DeepSeek vision models are NOT compatible with this pipeline.
     VISION_MODEL = os.getenv("VISION_MODEL", "gemini-1.5-flash")
 
+    # Optional explicit provider override ("openai", "deepseek", "gemini", "ollama").
+    # When empty, the engine infers from the model name.
+    TEXT_PROVIDER = os.getenv("TEXT_PROVIDER", "")
+    VISION_PROVIDER = os.getenv("VISION_PROVIDER", "")
+    # Ollama (local OpenAI-compatible endpoint).
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
     # Audio Settings
     SAMPLE_RATE = 16000
     CHUNK_SIZE = int(SAMPLE_RATE * 0.16)  # 160ms buffer
