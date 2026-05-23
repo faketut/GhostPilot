@@ -78,6 +78,36 @@ def get_prompt(q_type: str) -> str:
     return _load(q_type)
 
 
+def list_prompts() -> list[str]:
+    """Known prompt names (matches files we'll surface in the UI)."""
+    return list(_FALLBACKS.keys())
+
+
+def prompt_path(q_type: str) -> Path:
+    """Filesystem path where `q_type`'s prompt would live."""
+    return _PROMPT_DIR / f"{q_type}.md"
+
+
+def fallback_text(q_type: str) -> str:
+    return _FALLBACKS.get(q_type, "")
+
+
+def reload(q_type: str) -> str:
+    """Drop the cached value for one prompt and reload from disk."""
+    _cache.pop(q_type, None)
+    return _load(q_type)
+
+
+def save(q_type: str, text: str) -> Path:
+    """Write `text` to the prompt file and refresh the cache. Returns the path."""
+    path = prompt_path(q_type)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    _cache[q_type] = text.strip()
+    logger.info(f"Saved prompt: {path.name} ({len(text)} chars)")
+    return path
+
+
 # Pre-load at import time so first LLM call has zero disk I/O
 def _preload():
     for q_type in _FALLBACKS:

@@ -14,7 +14,7 @@ from typing import Callable, Optional
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QTabWidget, QWidget,
     QLineEdit, QPushButton, QMessageBox, QLabel, QToolButton,
-    QHBoxLayout, QComboBox,
+    QHBoxLayout, QComboBox, QPlainTextEdit, QListWidget, QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction
@@ -22,6 +22,7 @@ from PyQt6.QtGui import QAction
 from src.config import config
 from src import theme
 from src import settings_tests
+from src import prompt_loader
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,9 @@ class SettingsUI(QDialog):
         ))
         tabs.addTab(lang_w, "🌐 Language")
 
+        # ── Tab: Prompts (issue #10 in plan) ──
+        tabs.addTab(self._build_prompts_tab(), "📝 Prompts")
+
         root.addWidget(tabs, 1)
 
         # ── Buttons ──
@@ -192,6 +196,82 @@ class SettingsUI(QDialog):
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(save_btn)
         root.addLayout(btn_row)
+
+    # ── Prompts tab ──────────────────────────────────────────────────────
+
+    def _build_prompts_tab(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+
+        self._prompt_list = QListWidget()
+        self._prompt_list.setMaximumWidth(140)
+        for name in prompt_loader.list_prompts():
+            self._prompt_list.addItem(QListWidgetItem(name))
+        h.addWidget(self._prompt_list)
+
+        right = QVBoxLayout()
+        self._prompt_edit = QPlainTextEdit()
+        self._prompt_edit.setStyleSheet("font-family: 'Menlo','Consolas',monospace; font-size:12px;")
+        right.addWidget(self._prompt_edit, 1)
+
+        btn_row = QHBoxLayout()
+        self._prompt_status = QLabel("")
+        self._prompt_status.setStyleSheet("color:#9aa; font-size:11px;")
+        btn_row.addWidget(self._prompt_status, 1)
+        restore_btn = QPushButton("Restore default")
+        save_prompt_btn = QPushButton("💾 Save prompt")
+        restore_btn.clicked.connect(self._on_prompt_restore)
+        save_prompt_btn.clicked.connect(self._on_prompt_save)
+        btn_row.addWidget(restore_btn)
+        btn_row.addWidget(save_prompt_btn)
+        right.addLayout(btn_row)
+
+        rw = QWidget(); rw.setLayout(right)
+        h.addWidget(rw, 1)
+
+        self._prompt_list.currentRowChanged.connect(self._on_prompt_selected)
+        if self._prompt_list.count() > 0:
+            self._prompt_list.setCurrentRow(0)
+        return w
+
+    def _current_prompt_name(self) -> str | None:
+        it = self._prompt_list.currentItem()
+        return it.text() if it else None
+
+    def _on_prompt_selected(self, _row: int) -> None:
+        name = self._current_prompt_name()
+        if not name:
+            return
+        self._prompt_edit.setPlainText(prompt_loader.get_prompt(name))
+        self._prompt_status.setText(str(prompt_loader.prompt_path(name)))
+
+    def _on_prompt_save(self) -> None:
+        name = self._current_prompt_name()
+        if not name:
+            return
+        try:
+            path = prompt_loader.save(name, self._prompt_edit.toPlainText())
+            self._flash_prompt_status(f"Saved → {path.name}", ok=True)
+        except Exception as e:
+            self._flash_prompt_status(f"Save failed: {e}", ok=False)
+
+    def _on_prompt_restore(self) -> None:
+        name = self._current_prompt_name()
+        if not name:
+            return
+        self._prompt_edit.setPlainText(prompt_loader.fallback_text(name))
+        self._flash_prompt_status("Restored to bundled default (not yet saved)", ok=True)
+
+    def _flash_prompt_status(self, msg: str, *, ok: bool) -> None:
+        color = "#6c6" if ok else "#c66"
+        self._prompt_status.setText(msg)
+        self._prompt_status.setStyleSheet(f"color:{color}; font-size:11px;")
+        QTimer.singleShot(5000, lambda: (
+            self._prompt_status.setText(""),
+            self._prompt_status.setStyleSheet("color:#9aa; font-size:11px;"),
+        ))
 
     # ── Field builders ───────────────────────────────────────────────────
 
