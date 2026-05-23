@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 import logging
-import pyaudiowpatch as pyaudio
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -10,7 +12,15 @@ BITS_PER_SAMPLE = 16
 
 
 class AudioCapture:
+    """Windows-only WASAPI loopback capture (via pyaudiowpatch).
+
+    The pyaudiowpatch import is deferred to __init__ so this module can be
+    imported on non-Windows platforms for tests / UI work.
+    """
+
     def __init__(self, sample_rate=TARGET_RATE, chunk_size=2560):
+        import pyaudiowpatch as pyaudio  # lazy: only available on Windows
+        self._pyaudio_mod = pyaudio
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size  # 160ms = 2560 samples at 16kHz
         self.p = pyaudio.PyAudio()
@@ -22,6 +32,7 @@ class AudioCapture:
 
     def _find_loopback_device(self, *, name_contains: str = ""):
         """Finds the default WASAPI loopback device, with clear error messages."""
+        pyaudio = self._pyaudio_mod
         try:
             wasapi_info = self.p.get_host_api_info_by_type(pyaudio.paWASAPI)
         except OSError:
@@ -71,6 +82,7 @@ class AudioCapture:
 
     def start(self, output_queue: asyncio.Queue, *, device_name_contains: str = ""):
         """Starts capturing audio from the default WASAPI loopback device."""
+        pyaudio = self._pyaudio_mod
         try:
             device = self._find_loopback_device(name_contains=device_name_contains)
             native_rate = int(device["defaultSampleRate"])
@@ -164,5 +176,29 @@ class AudioCapture:
             self.p.terminate()
         except Exception:
             pass
-        self.p = pyaudio.PyAudio()
+        self.p = self._pyaudio_mod.PyAudio()
         self.start(output_queue, device_name_contains=device_name_contains)
+
+
+def make_audio_capture(sample_rate: int = TARGET_RATE, chunk_size: int = 2560, *, backend: str = ""):
+    """Factory: pick an audio backend.
+
+    Resolution order:
+      1. explicit `backend` arg ("pyaudiowpatch" | "sounddevice")
+      2. AUDIO_BACKEND env var
+      3. platform default — Windows: pyaudiowpatch (loopback); else: sounddevice (mic)
+
+    Note: sounddevice backend captures the default *microphone*, NOT system audio.
+    For real loopback on macOS install BlackHole; on Linux use a Pulseaudio monitor source.
+    """
+    import os
+    import sys
+
+    chosen = (backend or os.getenv("AUDIO_BACKEND", "")).strip().lower()
+    if not chosen:
+        chosen = "pyaudiowpatch" if sys.platform == "win32" else "sounddevice"
+
+    if chosen == "sounddevice":
+        from src.audio_capture_sounddevice import AudioCaptureSD
+        return AudioCaptureSD(sample_rate=sample_rate, chunk_size=chunk_size)
+    return AudioCapture(sample_rate=sample_rate, chunk_size=chunk_size)

@@ -1,6 +1,7 @@
 PyQt6>=6.6.0
 qasync>=0.27.1
-pyaudiowpatch>=0.2.12
+pyaudiowpatch>=0.2.12; sys_platform == "win32"
+sounddevice>=0.4.6; sys_platform != "win32"
 openai>=1.14.0
 google-genai>=1.0.0
 azure-cognitiveservices-speech>=1.37.0
