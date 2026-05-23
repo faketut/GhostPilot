@@ -5,6 +5,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _secret(name: str, *env_names: str, default: str = "") -> str:
+    """Resolve a secret: keyring → env vars (in order) → default. Import is local
+    to avoid a circular import at module load time."""
+    try:
+        from src import secret_store
+        v = secret_store.get(name)
+        if v:
+            return v
+    except Exception:
+        pass
+    for env in env_names or (name,):
+        v = os.getenv(env, "")
+        if v:
+            return v
+    return default
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         raw = os.getenv(name, str(default)) or str(default)
@@ -23,13 +40,15 @@ def _env_float(name: str, default: float) -> float:
 
 @dataclass
 class Config:
-    # API Keys (Loaded from .env via os.getenv)
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    # API Keys — resolved via keyring → env (in that order). Plain-text
+    # config.json values are still picked up via the SettingsUI loader because
+    # it writes os.environ on load.
+    OPENAI_API_KEY = _secret("OPENAI_API_KEY")
+    GEMINI_API_KEY = _secret("GEMINI_API_KEY")
+    DEEPSEEK_API_KEY = _secret("DEEPSEEK_API_KEY")
 
     # Azure Speech Service
-    AZURE_SPEECH_KEY = os.getenv("SPEECH_KEY", os.getenv("AZURE_SPEECH_KEY", ""))
+    AZURE_SPEECH_KEY = _secret("AZURE_SPEECH_KEY", "SPEECH_KEY", "AZURE_SPEECH_KEY")
     AZURE_SPEECH_REGION = os.getenv("SPEECH_REGION", os.getenv("AZURE_SPEECH_REGION", "eastus"))
     AZURE_SPEECH_ENDPOINT = os.getenv("ENDPOINT", os.getenv("AZURE_SPEECH_ENDPOINT", ""))
     # ASR recognition language. zh-CN for Chinese, en-US for English, etc.

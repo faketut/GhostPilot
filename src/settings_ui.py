@@ -114,6 +114,15 @@ class SettingsUI(QDialog):
 
         self._on_saved = on_saved
         self.saved_config = self._load_config()
+        # Layer keyring values on top so the form pre-fills with current secrets.
+        try:
+            from src import secret_store
+            for k in secret_store.SECRET_KEYS:
+                v = secret_store.get(k)
+                if v:
+                    self.saved_config[k] = v
+        except Exception as e:
+            logger.warning(f"keyring read for SettingsUI failed: {e}")
         # Maps config key → (kind, widget). Saved/loaded generically.
         self._fields: dict[str, tuple[str, QWidget]] = {}
 
@@ -246,6 +255,14 @@ class SettingsUI(QDialog):
         existing = self._load_config()
         existing.update(new_cfg)
 
+        # Route secrets through the OS keyring; on success, strip them from
+        # the dict so they never hit disk in plain text.
+        from src import secret_store
+        for k in secret_store.SECRET_KEYS:
+            if k in existing and isinstance(existing[k], str) and existing[k]:
+                if secret_store.set(k, existing[k]):
+                    existing.pop(k, None)
+
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(existing, f, indent=4, ensure_ascii=False)
@@ -272,15 +289,38 @@ class SettingsUI(QDialog):
 
 
 def apply_saved_config():
-    """Call at startup to override env/defaults with anything stored in config.json."""
+    """Call at startup to override env/defaults with anything stored in config.json.
+
+    Also performs a one-shot migration of any plain-text secrets in config.json
+    into the OS keyring, then rewrites the file without them.
+    """
     if not os.path.exists(CONFIG_FILE):
         return
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
+
+        # One-shot keyring migration
+        from src import secret_store
+        migrated = secret_store.migrate_from_dict(saved)
+        if migrated:
+            try:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(saved, f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"Could not rewrite {CONFIG_FILE} after migration: {e}")
+
         for k, v in saved.items():
             if hasattr(config, k):
                 setattr(config, k, v)
-        logger.info(f"Loaded {len(saved)} settings from {CONFIG_FILE}")
+
+        # Re-apply secrets from keyring (overrides any leftover values).
+        for k in secret_store.SECRET_KEYS:
+            v = secret_store.get(k)
+            if v and hasattr(config, k):
+                setattr(config, k, v)
+
+        logger.info(f"Loaded {len(saved)} settings from {CONFIG_FILE}"
+                    + (f" (migrated {len(migrated)} secret(s) to keyring)" if migrated else ""))
     except Exception as e:
         logger.error(f"Failed to apply {CONFIG_FILE}: {e}")
