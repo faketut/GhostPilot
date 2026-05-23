@@ -4,13 +4,24 @@ from collections.abc import Callable
 
 import numpy as np
 
-try:
-    from sentence_transformers import SentenceTransformer
-    HAS_ST = True
-    _ST_IMPORT_ERROR: Exception | None = None
-except Exception as e:
-    HAS_ST = False
-    _ST_IMPORT_ERROR = e
+# Sentence-transformers is large (~80MB + torch). Defer the import until we
+# actually have documents to embed (Phase 5.3 bundle slimming).
+HAS_ST: bool | None = None  # None = not probed yet
+_ST_IMPORT_ERROR: Exception | None = None
+SentenceTransformer = None  # type: ignore
+
+
+def _probe_st():
+    global HAS_ST, _ST_IMPORT_ERROR, SentenceTransformer
+    if HAS_ST is not None:
+        return
+    try:
+        from sentence_transformers import SentenceTransformer as _ST
+        SentenceTransformer = _ST
+        HAS_ST = True
+    except Exception as e:
+        HAS_ST = False
+        _ST_IMPORT_ERROR = e
 
 try:
     from rank_bm25 import BM25Okapi
@@ -40,19 +51,23 @@ class RAGManager:
         self.model = None
         self._bm25 = None
         self._bm25_tokens: list[list[str]] = []
-        if HAS_ST:
-            logger.info("Loading sentence transformer model for RAG...")
-            try:
-                self.model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-            except Exception as e:
-                # Common on Windows when torch DLLs fail to initialize.
-                logger.warning(f"Failed to init sentence-transformers (RAG disabled): {e}")
-                self.model = None
-        else:
+        # Model is loaded lazily on first load_documents() call with non-empty
+        # texts (Phase 5.3). Keeps cold-start fast when no knowledge base.
+
+    def _ensure_model(self):
+        if self.model is not None:
+            return
+        _probe_st()
+        if not HAS_ST:
             if _ST_IMPORT_ERROR is not None:
-                logger.warning(f"sentence-transformers unavailable (RAG disabled): {_ST_IMPORT_ERROR}")
-            else:
-                logger.warning("sentence-transformers unavailable (RAG disabled).")
+                logger.warning(f"sentence-transformers unavailable (RAG dense disabled): {_ST_IMPORT_ERROR}")
+            return
+        logger.info("Loading sentence transformer model for RAG...")
+        try:
+            self.model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+        except Exception as e:
+            logger.warning(f"Failed to init sentence-transformers (RAG dense disabled): {e}")
+            self.model = None
 
     @classmethod
     def _tokenize(cls, text: str) -> list[str]:
@@ -62,6 +77,8 @@ class RAGManager:
         """Vectorizes and loads documents (Resume, JD) into memory."""
         self.documents = texts
         logger.info(f"Loaded {len(texts)} documents into RAG memory.")
+        if texts:
+            self._ensure_model()
         if self.model and texts:
             self.embeddings = self.model.encode(self.documents, convert_to_numpy=True)
             # Normalize embeddings for fast cosine similarity

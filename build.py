@@ -157,10 +157,35 @@ def main():
                       help="Bundle into a folder (faster startup)")
     parser.add_argument("--upx", action="store_true",
                         help="Enable UPX compression (requires UPX in PATH)")
+    parser.add_argument("--size-report", action="store_true",
+                        help="After building, print the top 10 largest bundled packages.")
     args = parser.parse_args()
 
     ensure_pyinstaller()
     build(name=args.name, onefile=args.onefile, use_upx=args.upx)
+    if args.size_report:
+        _size_report(args.name)
+
+
+def _size_report(name: str) -> None:
+    """Walk dist/<name>/ and print the top-10 largest directories."""
+    from collections import defaultdict
+    root = Path(DIST_DIR) / name
+    if not root.exists():
+        # onefile mode → no folder. Just print the .exe size.
+        exe = Path(DIST_DIR) / f"{name}.exe"
+        if exe.exists():
+            print(f"\n{exe.name}: {exe.stat().st_size / 1_048_576:.1f} MB")
+        return
+    sizes: dict[str, int] = defaultdict(int)
+    for p in root.rglob("*"):
+        if p.is_file():
+            rel = p.relative_to(root)
+            top = rel.parts[0] if rel.parts else "(root)"
+            sizes[top] += p.stat().st_size
+    print("\nTop 10 largest bundled packages:")
+    for top, sz in sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:10]:
+        print(f"  {sz / 1_048_576:6.1f} MB  {top}")
 
 
 if __name__ == "__main__":
