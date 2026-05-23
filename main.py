@@ -9,6 +9,7 @@ from src.rag_manager import RAGManager
 from src.llm_engine import LLMEngine
 from src.hotkey_manager import HotkeyManager
 from src.config import config
+from src import crash_logger
 
 # Defer audio_capture import (pyaudiowpatch is Windows-only); on macOS/Linux
 # devs can still run UI / RAG / prompts iteration without the audio pipeline.
@@ -205,8 +206,16 @@ async def run_pipelines(app, loop):
         accent="🎙️ ASR",
         on_settings_saved=on_settings_saved,
         max_conversation_blocks=getattr(config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3),
+        on_stop=lambda: llm_engine.cancel("text"),
     )
-    ui_vision = OverlayUI(title="GhostPilot · Vision", with_tray=False, start_y=310, accent="📸 Vision", on_settings_saved=on_settings_saved)
+    ui_vision = OverlayUI(
+        title="GhostPilot · Vision",
+        with_tray=False,
+        start_y=310,
+        accent="📸 Vision",
+        on_settings_saved=on_settings_saved,
+        on_stop=lambda: llm_engine.cancel("vision"),
+    )
     # Start UI updaters and ASR now that UIs exist
     asr_task = loop.create_task(asr_client.start_streaming(audio_queue, text_queue, loop))
     ui_task_asr = loop.create_task(ui_updater(ui_asr, ui_queue_asr))
@@ -227,10 +236,16 @@ async def run_pipelines(app, loop):
             if image_bytes is None:
                 logger.info("Screenshot capture cancelled by user.")
                 return
-            await asyncio.wait_for(
-                llm_engine.generate_vision_answer_stream(image_bytes, ui_queue_vision),
-                timeout=getattr(config, "VISION_TIMEOUT_SEC", 8.0),
-            )
+            ui_vision.set_streaming(True)
+            try:
+                await asyncio.wait_for(
+                    llm_engine.generate_vision_answer_stream(image_bytes, ui_queue_vision),
+                    timeout=getattr(config, "VISION_TIMEOUT_SEC", 8.0),
+                )
+            finally:
+                ui_vision.set_streaming(False)
+        except asyncio.CancelledError:
+            logger.info("Vision stream cancelled by user.")
         except Exception as e:
             logger.error(f"Screenshot pipeline error: {e}")
             await ui_queue_vision.put({"type": "token", "text": f"\n[⚠️ Vision Error: {e}]"})
@@ -397,9 +412,16 @@ async def run_pipelines(app, loop):
             q_type = await llm_engine.classify_question_llm(question)
             ui_asr.show_thinking(q_type)
             ui_asr.append_block(f"[{speaker}] {question}\nA: ")
-            await llm_engine.generate_answer_stream(
-                question, ui_queue_asr, q_type=q_type
-            )
+            ui_asr.set_streaming(True)
+            try:
+                await llm_engine.generate_answer_stream(
+                    question, ui_queue_asr, q_type=q_type
+                )
+            finally:
+                ui_asr.set_streaming(False)
+        except asyncio.CancelledError:
+            ui_asr.set_streaming(False)
+            logger.info("Text stream cancelled by user (finalize-from-partial).")
         except Exception as e:
             logger.error(f"ASR finalize error: {e}")
 
@@ -419,9 +441,15 @@ async def run_pipelines(app, loop):
                     ui_asr.set_status("")
                     ui_asr.show_thinking(q_type)
                     ui_asr.append_block(f"[{speaker}] {question}\nA: ")
-                    await llm_engine.generate_answer_stream(
-                        question, ui_queue_asr, q_type=q_type
-                    )
+                    ui_asr.set_streaming(True)
+                    try:
+                        await llm_engine.generate_answer_stream(
+                            question, ui_queue_asr, q_type=q_type
+                        )
+                    except asyncio.CancelledError:
+                        logger.info("Text stream cancelled by user.")
+                    finally:
+                        ui_asr.set_streaming(False)
 
                 elif msg["type"] == "partial":
                     speaker = msg.get("speaker", "Unknown")
@@ -478,6 +506,10 @@ async def run_pipelines(app, loop):
 def main():
     set_dpi_awareness()
 
+    log_path = crash_logger.install()
+    if log_path:
+        logger.info(f"Crash log: {log_path}")
+
     try:
         from PyQt6.QtWidgets import QApplication
         from qasync import QEventLoop
@@ -498,13 +530,15 @@ def main():
 
     with loop:
         # Surface unexpected asyncio/qasync errors instead of silently stopping.
+        _crash_log = logging.getLogger("crash")
+
         def _loop_exc_handler(_loop, context):
             msg = context.get("message", "Asyncio exception")
             exc = context.get("exception")
             if exc:
-                logger.error(f"{msg}: {exc}")
+                _crash_log.error(f"{msg}: {exc}", exc_info=exc)
             else:
-                logger.error(msg)
+                _crash_log.error(msg)
 
         loop.set_exception_handler(_loop_exc_handler)
 

@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
 from PyQt6.QtGui import (
     QFont, QColor, QIcon, QPixmap, QPainter, QBrush, QGuiApplication, QTextCursor,
+    QShortcut, QKeySequence,
 )
 
 from src.windows_api import enable_window_stealth, set_window_interaction_mode, enable_mica
@@ -124,6 +125,7 @@ class _DragHeader(QWidget):
         on_clear,
         on_copy,
         on_toggle_interaction,
+        on_stop=None,
     ):
         super().__init__(parent_window)
         self._win = parent_window
@@ -151,11 +153,14 @@ class _DragHeader(QWidget):
             b.clicked.connect(slot)
             return b
 
-        # Header controls: lock state · clear · copy
+        # Header controls: lock state · stop · clear · copy
         self._lock_btn = _tb("👻", "Click-through (Alt+A to toggle)", on_toggle_interaction)
+        self._stop_btn = _tb("⏹", "Stop generation (Esc)", on_stop or (lambda: None))
+        self._stop_btn.setVisible(False)
         self._clear_btn = _tb("🧹", "Clear", on_clear)
         self._copy_btn = _tb("📋", "Copy last answer", on_copy)
         layout.addWidget(self._lock_btn)
+        layout.addWidget(self._stop_btn)
         layout.addWidget(self._clear_btn)
         layout.addWidget(self._copy_btn)
 
@@ -172,7 +177,7 @@ class _DragHeader(QWidget):
             f"border: 0; font-size: 12px; }} "
             f"QToolButton:hover {{ color: {pal['text_primary']}; }}"
         )
-        for b in (self._lock_btn, self._clear_btn, self._copy_btn):
+        for b in (self._lock_btn, self._stop_btn, self._clear_btn, self._copy_btn):
             b.setStyleSheet(btn_css)
         self.setStyleSheet(
             f"background: {pal['bg_header']}; border-bottom: 1px solid {pal['border']};"
@@ -270,6 +275,7 @@ class OverlayUI(QMainWindow):
         max_conversation_blocks: int | None = None,
         geometry_key: str = "OVERLAY_ASR_GEOMETRY",
         hotkey_hint: str | None = None,
+        on_stop=None,
     ):
         super().__init__()
         self.is_interactive = True   # toggled by Alt+A
@@ -280,6 +286,7 @@ class OverlayUI(QMainWindow):
         self._start_y = start_y
         self._accent = accent
         self._on_settings_saved = on_settings_saved
+        self._on_stop = on_stop
         self._geometry_key = geometry_key
         self._hotkey_hint = hotkey_hint
         self._status_flash_timer: Optional[QTimer] = None
@@ -359,9 +366,14 @@ class OverlayUI(QMainWindow):
             on_clear=self.clear,
             on_copy=self.copy_last_block,
             on_toggle_interaction=self.toggle_interaction,
+            on_stop=self._handle_stop,
         )
         self._header._badge.setText(self._accent)
         vbox.addWidget(self._header)
+
+        # Esc → stop generation (works only when overlay is interactive)
+        self._esc_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self._esc_shortcut.activated.connect(self._handle_stop)
 
         # Streamed-text widget (issue #16): QTextBrowser + delta append.
         self._content = QTextBrowser()
@@ -471,6 +483,22 @@ class OverlayUI(QMainWindow):
         dlg.exec()
 
     # ── Public API ────────────────────────────────────────────────────────
+
+    def set_streaming(self, streaming: bool) -> None:
+        """Show/hide the ⏹ Stop button. Called by main.py around stream tasks."""
+        try:
+            self._header._stop_btn.setVisible(bool(streaming))
+        except Exception:
+            pass
+
+    def _handle_stop(self) -> None:
+        """Invoke the on_stop callback (if any) and flash a status."""
+        if self._on_stop is not None:
+            try:
+                self._on_stop()
+                self._flash_bottom_status("⏹ Stopping…", duration_ms=900)
+            except Exception as e:
+                logger.warning(f"Stop callback failed: {e}")
 
     def show_thinking(self, q_type: str = ""):
         self._full_text = self._full_text or ""

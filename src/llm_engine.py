@@ -124,6 +124,27 @@ class LLMEngine:
     def __init__(self, rag_manager: RAGManager):
         self.rag = rag_manager
         self._init_clients()
+        # Track in-flight streaming tasks so a UI Stop button / Esc can cancel them.
+        self._active_tasks: dict[str, asyncio.Task] = {}
+
+    def register_task(self, kind: str, task: asyncio.Task) -> None:
+        """Register a running stream task under 'text' | 'vision' so it can be cancelled."""
+        prev = self._active_tasks.get(kind)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        self._active_tasks[kind] = task
+        task.add_done_callback(lambda t, k=kind: self._active_tasks.pop(k, None) if self._active_tasks.get(k) is t else None)
+
+    def cancel(self, kind: str = "all") -> int:
+        """Cancel current text/vision/all streams. Returns number of tasks cancelled."""
+        targets = ("text", "vision") if kind == "all" else (kind,)
+        n = 0
+        for k in targets:
+            t = self._active_tasks.get(k)
+            if t is not None and not t.done():
+                t.cancel()
+                n += 1
+        return n
 
     def _init_clients(self):
         def _is_deepseek_model(model_name: str) -> bool:
@@ -275,6 +296,9 @@ class LLMEngine:
         q_type: str | None = None,
     ):
         """Classify (optional) → RAG / algorithm.md → LLM → stream tokens."""
+        cur = asyncio.current_task()
+        if cur is not None:
+            self.register_task("text", cur)
         if q_type is None:
             q_type = await self.classify_question_llm(question)
         logger.info("[%s] %s", q_type.upper(), question)
@@ -288,6 +312,7 @@ class LLMEngine:
             vision_mode=False,
         )
 
+        stream = None
         try:
             stream = await self.text_client.chat.completions.create(
                 model=config.TEXT_MODEL,
@@ -301,9 +326,19 @@ class LLMEngine:
                 if delta is not None:
                     await ui_queue.put({"type": "token", "text": delta})
 
+        except asyncio.CancelledError:
+            logger.info("Text stream cancelled.")
+            await ui_queue.put({"type": "token", "text": "\n[⏹ stopped]"})
+            raise
         except Exception as e:
             logger.error("LLM text error: %s", e)
             await ui_queue.put({"type": "token", "text": f"\n[⚠️ {e}]"})
+        finally:
+            if stream is not None:
+                try:
+                    await stream.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def _compress_jpeg(image_bytes: bytes) -> bytes:
@@ -423,10 +458,16 @@ class LLMEngine:
             max_tokens=550,
             temperature=0.25,
         )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content if chunk.choices else None
-            if delta is not None:
-                await ui_queue.put({"type": "token", "text": delta})
+        try:
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta is not None:
+                    await ui_queue.put({"type": "token", "text": delta})
+        finally:
+            try:
+                await stream.close()
+            except Exception:
+                pass
 
     async def _vision_step_b_gemini(
         self, compressed: bytes, q_type: str, visible_question: str, ui_queue: asyncio.Queue
@@ -460,9 +501,19 @@ class LLMEngine:
             ],
             config=gemini_config,
         )
-        async for chunk in stream:
-            if chunk.text:
-                await ui_queue.put({"type": "token", "text": chunk.text})
+        try:
+            async for chunk in stream:
+                if chunk.text:
+                    await ui_queue.put({"type": "token", "text": chunk.text})
+        finally:
+            close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+            if close is not None:
+                try:
+                    res = close()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
 
     async def generate_vision_answer_stream(
         self, image_bytes: bytes, ui_queue: asyncio.Queue
@@ -471,6 +522,9 @@ class LLMEngine:
         Compress screenshot → classify + extract question (vision) →
         RAG / algorithm.md → final vision stream.
         """
+        cur = asyncio.current_task()
+        if cur is not None:
+            self.register_task("vision", cur)
         logger.info("Vision answer requested (two-step).")
         try:
             compressed = self._compress_jpeg(image_bytes)
@@ -504,6 +558,10 @@ class LLMEngine:
             else:
                 await self._vision_step_b_openai(compressed, q_type, visible_question, ui_queue)
 
+        except asyncio.CancelledError:
+            logger.info("Vision stream cancelled.")
+            await ui_queue.put({"type": "token", "text": "\n[⏹ stopped]"})
+            raise
         except Exception as e:
             logger.error("Vision LLM error: %s", e)
             await ui_queue.put({"type": "token", "text": f"\n[⚠️ Vision Error: {e}]"})
