@@ -13,14 +13,15 @@ from typing import Callable, Optional
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QTabWidget, QWidget,
-    QLineEdit, QPushButton, QMessageBox,
+    QLineEdit, QPushButton, QMessageBox, QLabel, QToolButton,
     QHBoxLayout, QComboBox,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction
 
 from src.config import config
 from src import theme
+from src import settings_tests
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ class SettingsUI(QDialog):
         azure = QFormLayout()
         azure_w = QWidget()
         azure_w.setLayout(azure)
-        azure.addRow("Subscription key:",   self._add_secret("AZURE_SPEECH_KEY", config.AZURE_SPEECH_KEY))
+        azure.addRow("Subscription key:",   self._add_secret("AZURE_SPEECH_KEY", config.AZURE_SPEECH_KEY, test="azure"))
         azure.addRow("Region (e.g. eastus):", self._add_text("AZURE_SPEECH_REGION", config.AZURE_SPEECH_REGION))
         azure.addRow("Custom endpoint (optional):", self._add_text("AZURE_SPEECH_ENDPOINT", config.AZURE_SPEECH_ENDPOINT))
         azure.addRow("ASR language:", self._add_combo("ASR_LANGUAGE", config.ASR_LANGUAGE, _ASR_LANG_OPTIONS))
@@ -146,9 +147,9 @@ class SettingsUI(QDialog):
         llm = QFormLayout()
         llm_w = QWidget()
         llm_w.setLayout(llm)
-        llm.addRow("OpenAI API key:",   self._add_secret("OPENAI_API_KEY", config.OPENAI_API_KEY))
-        llm.addRow("DeepSeek API key:", self._add_secret("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY))
-        llm.addRow("Gemini API key:",   self._add_secret("GEMINI_API_KEY", config.GEMINI_API_KEY))
+        llm.addRow("OpenAI API key:",   self._add_secret("OPENAI_API_KEY", config.OPENAI_API_KEY, test="openai"))
+        llm.addRow("DeepSeek API key:", self._add_secret("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY, test="deepseek"))
+        llm.addRow("Gemini API key:",   self._add_secret("GEMINI_API_KEY", config.GEMINI_API_KEY, test="gemini"))
         llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
         llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
         tabs.addTab(llm_w, "🤖 LLM")
@@ -200,7 +201,7 @@ class SettingsUI(QDialog):
         self._fields[key] = ("text", field)
         return field
 
-    def _add_secret(self, key: str, fallback: str) -> QLineEdit:
+    def _add_secret(self, key: str, fallback: str, *, test: str | None = None) -> QWidget:
         field = QLineEdit()
         field.setText(self.saved_config.get(key, fallback))
         field.setEchoMode(QLineEdit.EchoMode.Password)
@@ -216,7 +217,62 @@ class SettingsUI(QDialog):
         action.toggled.connect(_toggle)
         field.addAction(action, QLineEdit.ActionPosition.TrailingPosition)
         self._fields[key] = ("secret", field)
-        return field
+        if test is None:
+            return field
+        return self._wrap_with_test(field, test, key)
+
+    # ── Connection-test row ──────────────────────────────────────────────
+
+    def _wrap_with_test(self, field: QLineEdit, provider: str, key: str) -> QWidget:
+        """Wrap a secret field with a 🧪 test button and inline status label."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        h.addWidget(field, 1)
+
+        btn = QToolButton()
+        btn.setText("🧪")
+        btn.setToolTip(f"Test {provider} connection")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        h.addWidget(btn)
+
+        status = QLabel("")
+        status.setStyleSheet("color:#9aa; font-size:11px;")
+        status.setMinimumWidth(110)
+        h.addWidget(status)
+
+        def _on_click():
+            btn.setEnabled(False)
+            status.setText("… testing")
+            status.setStyleSheet("color:#9aa; font-size:11px;")
+            # Snapshot live form values rather than saved config.
+            params = self._snapshot_for_test()
+            params[key] = field.text().strip()
+            settings_tests.run_test(
+                provider, params,
+                lambda ok, msg: self._show_test_result(btn, status, ok, msg),
+            )
+
+        btn.clicked.connect(_on_click)
+        return row
+
+    def _snapshot_for_test(self) -> dict:
+        out: dict = {}
+        for k, (_kind, w) in self._fields.items():
+            if isinstance(w, QLineEdit):
+                out[k] = w.text().strip()
+        return out
+
+    def _show_test_result(self, btn: QToolButton, status: QLabel, ok: bool, msg: str) -> None:
+        btn.setEnabled(True)
+        if ok:
+            status.setText(f"✓ {msg}")
+            status.setStyleSheet("color:#6c6; font-size:11px;")
+        else:
+            status.setText(f"✗ {msg}")
+            status.setStyleSheet("color:#c66; font-size:11px;")
+        QTimer.singleShot(8000, lambda: (status.setText(""), status.setStyleSheet("color:#9aa; font-size:11px;")))
 
     def _add_combo(self, key: str, current: str, options: list[tuple[str, str]]) -> QComboBox:
         combo = QComboBox()
