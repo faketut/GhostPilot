@@ -25,6 +25,21 @@ def _iter_files(root: Path, patterns: list[str]) -> Iterable[Path]:
         yield from root.rglob(pat)
 
 
+def list_knowledge_files(
+    root_dir: str,
+    *,
+    patterns: list[str] | None = None,
+    max_files: int = 500,
+) -> list[Path]:
+    """Return absolute paths of knowledge files that ``load_knowledge_dir`` would read."""
+    patterns = patterns or ["*.md", "*.txt"]
+    root = _resolve_root(root_dir)
+    if not root.exists():
+        return []
+    files = [p for p in _iter_files(root, patterns) if p.is_file()]
+    return sorted(set(files))[:max_files]
+
+
 def _chunk_text(text: str, *, chunk_chars: int, overlap_chars: int) -> list[str]:
     """
     Simple character-based chunker with overlap.

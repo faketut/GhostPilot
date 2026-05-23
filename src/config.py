@@ -90,6 +90,9 @@ class Config:
     AUDIO_DEVICE_CONTAINS = os.getenv("AUDIO_DEVICE_CONTAINS", "")  # substring match
     AUDIO_RECONNECT_SEC = _env_float("AUDIO_RECONNECT_SEC", 2.0)
     AUDIO_WATCHDOG_SEC = _env_float("AUDIO_WATCHDOG_SEC", 2.0)  # no-callback threshold
+    # Backend: "" (auto: win32→pyaudiowpatch, else→sounddevice), "pyaudiowpatch", or "sounddevice".
+    # sounddevice captures the *microphone*, not system loopback (use BlackHole on macOS for loopback).
+    AUDIO_BACKEND = os.getenv("AUDIO_BACKEND", "")
 
     # ASR segmentation
     ASR_PARTIAL_SILENCE_MS = _env_int("ASR_PARTIAL_SILENCE_MS", 650)
@@ -138,6 +141,8 @@ class Config:
     KNOWLEDGE_PATTERNS = os.getenv("KNOWLEDGE_PATTERNS", "*.md,*.txt")
     KNOWLEDGE_CHUNK_CHARS = _env_int("KNOWLEDGE_CHUNK_CHARS", 900)
     KNOWLEDGE_OVERLAP_CHARS = _env_int("KNOWLEDGE_OVERLAP_CHARS", 120)
+    # KB auto-rebuild watcher: poll knowledge files mtimes every N seconds (0 disables).
+    KB_WATCH_INTERVAL_SEC = _env_int("KB_WATCH_INTERVAL_SEC", 5)
 
     # Per-overlay geometry persisted by the UI (list [x, y, w, h]). None = use defaults.
     OVERLAY_ASR_GEOMETRY = None

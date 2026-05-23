@@ -120,7 +120,8 @@ _ASR_BACKEND_OPTIONS = [
 
 
 class SettingsUI(QDialog):
-    def __init__(self, parent=None, *, on_saved: Optional[Callable[[dict], None]] = None):
+    def __init__(self, parent=None, *, on_saved: Optional[Callable[[dict], None]] = None,
+                 on_rebuild_kb: Optional[Callable[[], int]] = None):
         super().__init__(parent)
         self.setWindowTitle("GhostPilot Copilot — Settings")
         self.setMinimumWidth(520)
@@ -131,6 +132,7 @@ class SettingsUI(QDialog):
         )
 
         self._on_saved = on_saved
+        self._on_rebuild_kb = on_rebuild_kb
         self.saved_config = self._load_config()
         # Layer keyring values on top so the form pre-fills with current secrets.
         try:
@@ -175,17 +177,25 @@ class SettingsUI(QDialog):
         llm = QFormLayout()
         llm_w = QWidget()
         llm_w.setLayout(llm)
+
+        llm.addRow(self._section_header("Text generation"))
+        llm.addRow("Text provider:",    self._add_combo("TEXT_PROVIDER", getattr(config, "TEXT_PROVIDER", ""), _TEXT_PROVIDER_OPTIONS))
+        llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
+        llm.addRow("Context turns (0=off):", self._add_text("CONTEXT_TURNS", str(getattr(config, "CONTEXT_TURNS", 0))))
+
+        llm.addRow(self._section_header("Vision"))
+        llm.addRow("Vision provider:",  self._add_combo("VISION_PROVIDER", getattr(config, "VISION_PROVIDER", ""), _VISION_PROVIDER_OPTIONS))
+        llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
+
+        llm.addRow(self._section_header("API keys"))
         llm.addRow("OpenAI API key:",   self._add_secret("OPENAI_API_KEY", config.OPENAI_API_KEY, test="openai"))
         self._track_scoped(llm, "OPENAI_API_KEY")
         llm.addRow("DeepSeek API key:", self._add_secret("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY, test="deepseek"))
         self._track_scoped(llm, "DEEPSEEK_API_KEY")
         llm.addRow("Gemini API key:",   self._add_secret("GEMINI_API_KEY", config.GEMINI_API_KEY, test="gemini"))
         self._track_scoped(llm, "GEMINI_API_KEY")
-        llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
-        llm.addRow("Text provider:",    self._add_combo("TEXT_PROVIDER", getattr(config, "TEXT_PROVIDER", ""), _TEXT_PROVIDER_OPTIONS))
-        llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
-        llm.addRow("Vision provider:",  self._add_combo("VISION_PROVIDER", getattr(config, "VISION_PROVIDER", ""), _VISION_PROVIDER_OPTIONS))
-        llm.addRow("Context turns (0=off):", self._add_text("CONTEXT_TURNS", str(getattr(config, "CONTEXT_TURNS", 0))))
+
+        llm.addRow(self._section_header("Ollama (local)"))
         # ── Ollama (local) ──
         ollama_row = QHBoxLayout()
         ollama_field = self._add_text("OLLAMA_BASE_URL", getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434/v1"))
@@ -402,10 +412,15 @@ class SettingsUI(QDialog):
         self._prompt_status = QLabel("")
         self._prompt_status.setStyleSheet("color:#9aa; font-size:11px;")
         btn_row.addWidget(self._prompt_status, 1)
+        rebuild_kb_btn = QPushButton("🔄 Rebuild KB")
+        rebuild_kb_btn.setToolTip("Re-read the knowledge/ directory into the RAG index")
+        rebuild_kb_btn.setEnabled(self._on_rebuild_kb is not None)
+        rebuild_kb_btn.clicked.connect(self._on_rebuild_kb_clicked)
         restore_btn = QPushButton("Restore default")
         save_prompt_btn = QPushButton("💾 Save prompt")
         restore_btn.clicked.connect(self._on_prompt_restore)
         save_prompt_btn.clicked.connect(self._on_prompt_save)
+        btn_row.addWidget(rebuild_kb_btn)
         btn_row.addWidget(restore_btn)
         btn_row.addWidget(save_prompt_btn)
         right.addLayout(btn_row)
@@ -446,6 +461,15 @@ class SettingsUI(QDialog):
         self._prompt_edit.setPlainText(prompt_loader.fallback_text(name))
         self._flash_prompt_status("Restored to bundled default (not yet saved)", ok=True)
 
+    def _on_rebuild_kb_clicked(self) -> None:
+        if self._on_rebuild_kb is None:
+            return
+        try:
+            n = self._on_rebuild_kb()
+            self._flash_prompt_status(f"KB rebuilt: {n} chunks", ok=True)
+        except Exception as e:
+            self._flash_prompt_status(f"KB rebuild failed: {e}", ok=False)
+
     def _flash_prompt_status(self, msg: str, *, ok: bool) -> None:
         color = "#6c6" if ok else "#c66"
         self._prompt_status.setText(msg)
@@ -456,6 +480,17 @@ class SettingsUI(QDialog):
         ))
 
     # ── Field builders ───────────────────────────────────────────────────
+
+    def _section_header(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        pal = theme.palette()
+        lbl.setStyleSheet(
+            f"color:{pal['accent_blue']}; font-weight:bold; "
+            "font-size:11px; text-transform:uppercase; "
+            "padding-top:6px; padding-bottom:2px; "
+            f"border-bottom:1px solid {pal['dialog_border']};"
+        )
+        return lbl
 
     def _add_text(self, key: str, fallback: str) -> QLineEdit:
         field = QLineEdit()

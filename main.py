@@ -41,12 +41,13 @@ def _make_asr_client():
 
 # Defer audio_capture import (pyaudiowpatch is Windows-only); on macOS/Linux
 # devs can still run UI / RAG / prompts iteration without the audio pipeline.
+# Use make_audio_capture() factory to pick the right backend at runtime.
 try:
-    from src.audio_capture import AudioCapture
+    from src.audio_capture import make_audio_capture
     AUDIO_AVAILABLE = True
     _AUDIO_IMPORT_ERROR: Exception | None = None
 except Exception as e:
-    AudioCapture = None  # type: ignore[assignment]
+    make_audio_capture = None  # type: ignore[assignment]
     AUDIO_AVAILABLE = False
     _AUDIO_IMPORT_ERROR = e
 
@@ -75,6 +76,15 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
                 ui.update_text(msg["text"], append=True)
             elif msg["type"] == "clear":
                 ui.update_text("", append=False)
+            elif msg["type"] == "info":
+                # Observability strip (provider · rag:N)
+                try:
+                    ui.set_info_footer(
+                        provider=msg.get("provider", ""),
+                        rag_hits=msg.get("rag_hits"),
+                    )
+                except Exception:
+                    pass
             elif msg["type"] == "usage":
                 # Token / cost footer (Phase 2.3)
                 try:
@@ -110,7 +120,7 @@ async def run_pipelines(app, loop):
     ui_asr = None
     ui_vision = None
 
-    audio_capture = AudioCapture(sample_rate=config.SAMPLE_RATE, chunk_size=config.CHUNK_SIZE) if AUDIO_AVAILABLE else None
+    audio_capture = make_audio_capture(sample_rate=config.SAMPLE_RATE, chunk_size=config.CHUNK_SIZE) if AUDIO_AVAILABLE else None
     if not AUDIO_AVAILABLE:
         logger.warning(
             "Audio capture unavailable on this platform (%s). "
@@ -120,24 +130,31 @@ async def run_pipelines(app, loop):
     asr_client = _make_asr_client()
     rag_manager = RAGManager()
     # ── Load local knowledge base into RAG (resume / cheatsheets / notes) ──
-    try:
-        from src.knowledge_loader import load_knowledge_dir
-
+    def _kb_params() -> dict:
         patterns = [
             p.strip()
             for p in getattr(config, "KNOWLEDGE_PATTERNS", "*.md,*.txt").split(",")
             if p.strip()
         ]
-        docs = load_knowledge_dir(
-            getattr(config, "KNOWLEDGE_DIR", "knowledge"),
-            patterns=patterns,
-            chunk_chars=getattr(config, "KNOWLEDGE_CHUNK_CHARS", 900),
-            overlap_chars=getattr(config, "KNOWLEDGE_OVERLAP_CHARS", 120),
-        )
-        if docs:
-            rag_manager.load_documents(docs)
-    except Exception as e:
-        logger.warning(f"Failed to load local knowledge base (RAG): {e}")
+        return {
+            "patterns": patterns,
+            "chunk_chars": getattr(config, "KNOWLEDGE_CHUNK_CHARS", 900),
+            "overlap_chars": getattr(config, "KNOWLEDGE_OVERLAP_CHARS", 120),
+        }
+
+    def rebuild_kb() -> int:
+        try:
+            n = rag_manager.rebuild_from_dir(
+                getattr(config, "KNOWLEDGE_DIR", "knowledge"),
+                **_kb_params(),
+            )
+            logger.info("KB rebuilt: %d chunks", n)
+            return n
+        except Exception as e:
+            logger.warning(f"KB rebuild failed: {e}")
+            return 0
+
+    rebuild_kb()
     llm_engine = LLMEngine(rag_manager)
     # Preheat the LLM connection in the background so the first real request
     # doesn't pay the cold-start cost (Phase 2.4).
@@ -256,6 +273,7 @@ async def run_pipelines(app, loop):
         max_conversation_blocks=getattr(config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3),
         on_stop=lambda: llm_engine.cancel("text"),
         on_clear=llm_engine.clear_history,
+        on_rebuild_kb=rebuild_kb,
     )
     ui_vision = OverlayUI(
         title="GhostPilot · Vision",
@@ -269,6 +287,25 @@ async def run_pipelines(app, loop):
     asr_task = loop.create_task(asr_client.start_streaming(audio_queue, text_queue, loop))
     ui_task_asr = loop.create_task(ui_updater(ui_asr, ui_queue_asr))
     ui_task_vision = loop.create_task(ui_updater(ui_vision, ui_queue_vision))
+
+    # ── KB mtime watcher: rebuild RAG when knowledge/ files change ──
+    async def _kb_watch_loop():
+        interval = max(0, int(getattr(config, "KB_WATCH_INTERVAL_SEC", 5)))
+        if interval == 0:
+            return
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                n = rag_manager.rebuild_if_stale()
+                if n is not None:
+                    logger.info("KB auto-rebuilt: %d chunks (mtime changed)", n)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"KB watch loop error: {e}")
+                await asyncio.sleep(interval)
+
+    kb_watch_task = loop.create_task(_kb_watch_loop())
 
     # ── Hotkey: Alt+P — area-select screenshot → Vision LLM ──────────────
     async def on_screenshot():

@@ -53,6 +53,10 @@ class RAGManager:
         self.model = None
         self._bm25 = None
         self._bm25_tokens: list[list[str]] = []
+        # Source-file tracking for incremental rebuild (see rebuild_from_dir).
+        self._kb_root: str | None = None
+        self._kb_params: dict | None = None
+        self._kb_mtimes: dict[str, float] = {}
         # Model is loaded lazily on first load_documents() call with non-empty
         # texts (Phase 5.3). Keeps cold-start fast when no knowledge base.
 
@@ -174,3 +178,60 @@ class RAGManager:
             mode, len(out), min_score, source_filter is not None,
         )
         return out
+
+    # ── Incremental rebuild (Phase: KB hot-reload) ──────────────────────
+
+    def rebuild_from_dir(
+        self,
+        dir_path: str,
+        *,
+        patterns: list[str] | None = None,
+        chunk_chars: int = 900,
+        overlap_chars: int = 120,
+    ) -> int:
+        """Re-read the knowledge directory and replace the in-memory index.
+
+        Returns the number of chunks loaded. Safe to call repeatedly.
+        """
+        from src.knowledge_loader import load_knowledge_dir, list_knowledge_files
+
+        params = {
+            "patterns": list(patterns) if patterns else None,
+            "chunk_chars": chunk_chars,
+            "overlap_chars": overlap_chars,
+        }
+        docs = load_knowledge_dir(
+            dir_path,
+            patterns=patterns,
+            chunk_chars=chunk_chars,
+            overlap_chars=overlap_chars,
+        )
+        self.load_documents(docs)
+        files = list_knowledge_files(dir_path, patterns=patterns)
+        self._kb_root = dir_path
+        self._kb_params = params
+        self._kb_mtimes = {str(p): p.stat().st_mtime for p in files if p.exists()}
+        return len(docs)
+
+    def is_stale(self) -> bool:
+        """True if any tracked KB file has been added / removed / modified since the last rebuild."""
+        if self._kb_root is None:
+            return False
+        from src.knowledge_loader import list_knowledge_files
+
+        patterns = (self._kb_params or {}).get("patterns")
+        files = list_knowledge_files(self._kb_root, patterns=patterns)
+        current = {}
+        for p in files:
+            try:
+                current[str(p)] = p.stat().st_mtime
+            except OSError:
+                continue
+        return current != self._kb_mtimes
+
+    def rebuild_if_stale(self) -> int | None:
+        """If is_stale(), rebuild and return the new chunk count; else None."""
+        if not self.is_stale():
+            return None
+        params = self._kb_params or {}
+        return self.rebuild_from_dir(self._kb_root or "knowledge", **params)
