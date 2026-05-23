@@ -153,6 +153,33 @@ class SettingsUI(QDialog):
         llm.addRow("Gemini API key:",   self._add_secret("GEMINI_API_KEY", config.GEMINI_API_KEY, test="gemini"))
         llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
         llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
+        llm.addRow("Context turns (0=off):", self._add_text("CONTEXT_TURNS", str(getattr(config, "CONTEXT_TURNS", 0))))
+        # ── Ollama (local) ──
+        ollama_row = QHBoxLayout()
+        ollama_field = self._add_text("OLLAMA_BASE_URL", getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434/v1"))
+        ollama_btn = QToolButton(); ollama_btn.setText("🔍"); ollama_btn.setToolTip("Detect running Ollama instance")
+        ollama_status = QLabel(""); ollama_status.setMinimumWidth(140)
+        def _detect_ollama():
+            import urllib.request, json as _json
+            url = (ollama_field.text() or "").rstrip("/")
+            base = url.replace("/v1", "")
+            try:
+                with urllib.request.urlopen(f"{base}/api/tags", timeout=2) as r:
+                    data = _json.loads(r.read().decode("utf-8"))
+                models = [m.get("name", "?") for m in data.get("models", [])]
+                if models:
+                    ollama_status.setText(f"✓ {len(models)} models: {', '.join(models[:3])}")
+                    ollama_status.setStyleSheet("color: #2e7d32;")
+                else:
+                    ollama_status.setText("✓ running, no models")
+                    ollama_status.setStyleSheet("color: #2e7d32;")
+            except Exception as e:
+                ollama_status.setText(f"✗ {e}")
+                ollama_status.setStyleSheet("color: #c62828;")
+        ollama_btn.clicked.connect(_detect_ollama)
+        ollama_row.addWidget(ollama_field, 1); ollama_row.addWidget(ollama_btn); ollama_row.addWidget(ollama_status)
+        ollama_w = QWidget(); ollama_w.setLayout(ollama_row)
+        llm.addRow("Ollama base URL:", ollama_w)
         tabs.addTab(llm_w, "🤖 LLM")
 
         # ── Tab: Hotkeys (issue #4) ──
