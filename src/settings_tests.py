@@ -167,4 +167,26 @@ _PROVIDERS = {
     "deepseek": test_deepseek,
     "gemini": test_gemini,
     "azure": test_azure,
+    "ollama": None,  # filled below
 }
+
+
+@_timed
+def test_ollama(params):
+    base = (params.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1").rstrip("/")
+    # /api/tags lives on the root, not under /v1.
+    root = base[:-3].rstrip("/") if base.endswith("/v1") else base
+    import urllib.request
+    import json as _json
+    try:
+        with urllib.request.urlopen(f"{root}/api/tags", timeout=3) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+        models = [m.get("name", "?") for m in data.get("models", [])]
+        if not models:
+            return True, "running, no models pulled"
+        return True, f"{len(models)} models"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:80]}"
+
+
+_PROVIDERS["ollama"] = test_ollama

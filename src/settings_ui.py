@@ -101,6 +101,18 @@ _RESPONSE_LANG_OPTIONS = [
     ("中文 (Chinese)", "zh"),
     ("English", "en"),
 ]
+_TEXT_PROVIDER_OPTIONS = [
+    ("Auto (infer from model name)", ""),
+    ("OpenAI", "openai"),
+    ("DeepSeek", "deepseek"),
+    ("Gemini", "gemini"),
+    ("Ollama (local)", "ollama"),
+]
+_VISION_PROVIDER_OPTIONS = [
+    ("Auto (infer from model name)", ""),
+    ("OpenAI", "openai"),
+    ("Gemini", "gemini"),
+]
 
 
 class SettingsUI(QDialog):
@@ -152,7 +164,9 @@ class SettingsUI(QDialog):
         llm.addRow("DeepSeek API key:", self._add_secret("DEEPSEEK_API_KEY", config.DEEPSEEK_API_KEY, test="deepseek"))
         llm.addRow("Gemini API key:",   self._add_secret("GEMINI_API_KEY", config.GEMINI_API_KEY, test="gemini"))
         llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
+        llm.addRow("Text provider:",    self._add_combo("TEXT_PROVIDER", getattr(config, "TEXT_PROVIDER", ""), _TEXT_PROVIDER_OPTIONS))
         llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
+        llm.addRow("Vision provider:",  self._add_combo("VISION_PROVIDER", getattr(config, "VISION_PROVIDER", ""), _VISION_PROVIDER_OPTIONS))
         llm.addRow("Context turns (0=off):", self._add_text("CONTEXT_TURNS", str(getattr(config, "CONTEXT_TURNS", 0))))
         # ── Ollama (local) ──
         ollama_row = QHBoxLayout()
@@ -180,6 +194,52 @@ class SettingsUI(QDialog):
         ollama_row.addWidget(ollama_field, 1); ollama_row.addWidget(ollama_btn); ollama_row.addWidget(ollama_status)
         ollama_w = QWidget(); ollama_w.setLayout(ollama_row)
         llm.addRow("Ollama base URL:", ollama_w)
+
+        # ── Master test (selected text + vision providers) ──
+        test_row = QHBoxLayout()
+        test_btn = QPushButton("🧪 Test selected providers")
+        test_status = QLabel("")
+        test_status.setStyleSheet("color:#9aa; font-size:11px;")
+        test_row.addWidget(test_btn); test_row.addWidget(test_status, 1)
+
+        def _resolve_provider(combo_val: str, model: str, is_vision: bool) -> str:
+            v = (combo_val or "").strip().lower()
+            if v:
+                return v
+            m = (model or "").lower()
+            if not is_vision and (m.startswith("ollama/") or m.startswith("llama") or m.startswith("qwen") or m.startswith("mistral") or m.startswith("phi")):
+                return "ollama"
+            if "deepseek" in m:
+                return "deepseek"
+            if "gemini" in m:
+                return "gemini"
+            return "openai"
+
+        def _run_master_test():
+            test_btn.setEnabled(False)
+            test_status.setText("… testing text + vision")
+            test_status.setStyleSheet("color:#9aa; font-size:11px;")
+            params = self._snapshot_for_test()
+            text_p = _resolve_provider(params.get("TEXT_PROVIDER", ""), params.get("TEXT_MODEL", ""), is_vision=False)
+            vis_p = _resolve_provider(params.get("VISION_PROVIDER", ""), params.get("VISION_MODEL", ""), is_vision=True)
+            results: dict[str, tuple[bool, str]] = {}
+
+            def _maybe_done():
+                if "text" in results and "vision" in results:
+                    test_btn.setEnabled(True)
+                    ok_t, msg_t = results["text"]
+                    ok_v, msg_v = results["vision"]
+                    ok = ok_t and ok_v
+                    text = f"text({text_p}): {'✓' if ok_t else '✗'} {msg_t}  ·  vision({vis_p}): {'✓' if ok_v else '✗'} {msg_v}"
+                    test_status.setText(text)
+                    test_status.setStyleSheet(f"color:{'#6c6' if ok else '#c66'}; font-size:11px;")
+
+            settings_tests.run_test(text_p, params, lambda ok, msg: (results.__setitem__("text", (ok, msg)), _maybe_done()))
+            settings_tests.run_test(vis_p, params, lambda ok, msg: (results.__setitem__("vision", (ok, msg)), _maybe_done()))
+
+        test_btn.clicked.connect(_run_master_test)
+        test_w = QWidget(); test_w.setLayout(test_row)
+        llm.addRow("", test_w)
         tabs.addTab(llm_w, "🤖 LLM")
 
         # ── Tab: Hotkeys (issue #4) ──
