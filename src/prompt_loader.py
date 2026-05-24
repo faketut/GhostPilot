@@ -16,6 +16,7 @@ If a file is missing, a sensible inline fallback is used so the app never crashe
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,27 @@ def save(q_type: str, text: str) -> Path:
     _cache[q_type] = text.strip()
     logger.info(f"Saved prompt: {path} ({len(text)} chars)")
     return path
+
+
+@contextmanager
+def override_prompts(mapping: dict[str, str]):
+    """Temporarily swap cached prompts for the duration of the ``with`` block.
+
+    Used by ``session_replay`` to A/B-test alternate prompt text without
+    writing it to disk. Nested overrides stack (innermost wins) and the
+    original cache is restored on exit even if the body raises.
+    """
+    saved: dict[str, str | None] = {k: _cache.get(k) for k in mapping}
+    try:
+        for k, v in mapping.items():
+            _cache[k] = v
+        yield
+    finally:
+        for k, prev in saved.items():
+            if prev is None:
+                _cache.pop(k, None)
+            else:
+                _cache[k] = prev
 
 
 # Pre-load at import time so first LLM call has zero disk I/O

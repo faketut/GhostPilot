@@ -157,13 +157,21 @@ async def _drain_queue_to_text(queue: asyncio.Queue, stop: asyncio.Event,
     return "".join(parts)
 
 
-async def replay_turn(engine, turn: Turn) -> ReplayResult:
+async def replay_turn(
+    engine,
+    turn: Turn,
+    prompt_overrides: Optional[dict[str, str]] = None,
+) -> ReplayResult:
     """Re-run ``turn`` through ``engine`` and return the new answer.
 
     ``engine`` must implement ``generate_answer_stream(question, ui_queue, q_type=)``
     for text turns and ``generate_vision_answer_stream(image_bytes, ui_queue)``
     for vision turns. The UI queue receives the same shape the live app uses,
     so this works against the real ``LLMEngine`` *and* against test stubs.
+
+    ``prompt_overrides`` (optional): ``{q_type: prompt_text}`` applied via
+    :func:`src.prompt_loader.override_prompts` for the duration of the call,
+    enabling A/B-testing alternate prompts without writing to disk.
     """
     queue: asyncio.Queue = asyncio.Queue()
     stop = asyncio.Event()
@@ -186,7 +194,13 @@ async def replay_turn(engine, turn: Turn) -> ReplayResult:
 
     consumer = asyncio.create_task(_drain_queue_to_text(queue, stop, info))
     try:
-        await producer()
+        if prompt_overrides:
+            # Imported lazily so test stubs don't have to mock prompt_loader.
+            from src import prompt_loader
+            with prompt_loader.override_prompts(prompt_overrides):
+                await producer()
+        else:
+            await producer()
     except Exception as e:  # noqa: BLE001
         err = f"{type(e).__name__}: {e}"
         stop.set()

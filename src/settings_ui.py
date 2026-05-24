@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QTabWidget, QWidget,
     QLineEdit, QPushButton, QMessageBox, QLabel, QToolButton,
     QHBoxLayout, QComboBox, QPlainTextEdit, QListWidget, QListWidgetItem,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction
@@ -572,12 +572,38 @@ class SettingsUI(QDialog):
         self._sessions_summary.setWordWrap(True)
         right.addWidget(self._sessions_summary)
 
+        # Compare-to picker: when set, the right pane shows a side-by-side diff.
+        cmp_row = QHBoxLayout()
+        cmp_row.addWidget(QLabel("Compare to:"))
+        self._sessions_cmp = QComboBox()
+        self._sessions_cmp.addItem("(none — show single recording)", userData=None)
+        self._sessions_cmp.currentIndexChanged.connect(
+            lambda _i: self._on_session_selected(self._sessions_list.currentRow())
+        )
+        cmp_row.addWidget(self._sessions_cmp, 1)
+        right.addLayout(cmp_row)
+
+        # Two read-only edits inside a splitter — left = selected, right = compare.
+        mono = "font-family: 'Menlo','Consolas',monospace; font-size:12px;"
         self._sessions_view = QPlainTextEdit()
         self._sessions_view.setReadOnly(True)
-        self._sessions_view.setStyleSheet(
-            "font-family: 'Menlo','Consolas',monospace; font-size:12px;"
+        self._sessions_view.setStyleSheet(mono)
+        self._sessions_view_cmp = QPlainTextEdit()
+        self._sessions_view_cmp.setReadOnly(True)
+        self._sessions_view_cmp.setStyleSheet(mono)
+        self._sessions_split = QSplitter(Qt.Orientation.Horizontal)
+        self._sessions_split.addWidget(self._sessions_view)
+        self._sessions_split.addWidget(self._sessions_view_cmp)
+        self._sessions_split.setSizes([400, 400])
+        # Scroll-sync: when one side scrolls, mirror the other.
+        self._sessions_view.verticalScrollBar().valueChanged.connect(
+            self._sessions_view_cmp.verticalScrollBar().setValue
         )
-        right.addWidget(self._sessions_view, 1)
+        self._sessions_view_cmp.verticalScrollBar().valueChanged.connect(
+            self._sessions_view.verticalScrollBar().setValue
+        )
+        right.addWidget(self._sessions_split, 1)
+        self._sessions_view_cmp.setVisible(False)  # hidden until a compare target is picked
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -611,11 +637,18 @@ class SettingsUI(QDialog):
     def _refresh_sessions(self) -> None:
         self._sessions_list.clear()
         self._session_paths = []
+        # Preserve the compare-to selection across refresh if still present.
+        prev_cmp = self._sessions_cmp.currentData()
+        self._sessions_cmp.blockSignals(True)
+        self._sessions_cmp.clear()
+        self._sessions_cmp.addItem("(none — show single recording)", userData=None)
         root = self._recordings_root
         if not root.exists():
             self._sessions_summary.setText(f"No recordings under {root}")
             self._sessions_view.setPlainText("")
+            self._sessions_view_cmp.setPlainText("")
             self._replay_btn.setEnabled(False)
+            self._sessions_cmp.blockSignals(False)
             return
 
         entries: list[Path] = []
@@ -629,10 +662,18 @@ class SettingsUI(QDialog):
         if not entries:
             self._sessions_summary.setText(f"No recordings found in {root}")
             self._replay_btn.setEnabled(False)
+            self._sessions_cmp.blockSignals(False)
             return
         for p in entries:
             self._session_paths.append(p)
             self._sessions_list.addItem(QListWidgetItem(p.name))
+            self._sessions_cmp.addItem(p.name, userData=str(p))
+        # Restore previous compare-to selection if still in the list.
+        if prev_cmp is not None:
+            idx = self._sessions_cmp.findData(prev_cmp)
+            if idx >= 0:
+                self._sessions_cmp.setCurrentIndex(idx)
+        self._sessions_cmp.blockSignals(False)
         self._sessions_list.setCurrentRow(0)
 
     def _on_session_selected(self, row: int) -> None:
@@ -645,12 +686,46 @@ class SettingsUI(QDialog):
         except Exception as e:
             self._sessions_summary.setText(f"Failed to open: {e}")
             self._sessions_view.setPlainText("")
+            self._sessions_view_cmp.setPlainText("")
             self._replay_btn.setEnabled(False)
             return
-        self._sessions_summary.setText(
-            f"<b>{path.name}</b> · {len(turns)} turn(s)"
-        )
-        # Render the turns as plain text Q/A blocks.
+        self._sessions_view.setPlainText(self._render_turns(turns))
+
+        # Compare side, if selected.
+        cmp_data = self._sessions_cmp.currentData()
+        if cmp_data:
+            try:
+                cmp_path = Path(cmp_data)
+                cmp_dir = self._session_replay_mod.open_session(cmp_path)
+                cmp_turns = list(self._session_replay_mod.iter_turns(cmp_dir))
+                self._sessions_view_cmp.setPlainText(self._render_turns(cmp_turns))
+                self._sessions_view_cmp.setVisible(True)
+                self._sessions_summary.setText(
+                    f"<b>{path.name}</b> ({len(turns)} turn(s)) ↔ "
+                    f"<b>{cmp_path.name}</b> ({len(cmp_turns)} turn(s))"
+                )
+            except Exception as e:
+                self._sessions_view_cmp.setPlainText(f"(failed to open compare target: {e})")
+                self._sessions_view_cmp.setVisible(True)
+                self._sessions_summary.setText(f"<b>{path.name}</b> · {len(turns)} turn(s)")
+        else:
+            self._sessions_view_cmp.setVisible(False)
+            self._sessions_view_cmp.setPlainText("")
+            self._sessions_summary.setText(
+                f"<b>{path.name}</b> · {len(turns)} turn(s)"
+            )
+        self._replay_btn.setEnabled(bool(self._on_replay_session) and bool(turns))
+        self._current_session_path = path
+
+    @staticmethod
+    def _render_turns(turns) -> str:
+        """Render Turn objects as the plain-text Q/A blocks shown in Sessions.
+
+        Static so the diff view uses identical formatting on both sides — that
+        makes per-line scroll-sync land on the same turn boundary.
+        """
+        if not turns:
+            return "(empty recording)"
         blocks: list[str] = []
         for i, t in enumerate(turns, 1):
             tag = f"[{t.kind}/{t.q_type or '?'}]"
@@ -660,9 +735,7 @@ class SettingsUI(QDialog):
                 f"Q: {q}\n\n"
                 f"A: {t.original_answer.strip() or '(empty)'}\n"
             )
-        self._sessions_view.setPlainText("\n".join(blocks) or "(empty recording)")
-        self._replay_btn.setEnabled(bool(self._on_replay_session) and bool(turns))
-        self._current_session_path = path
+        return "\n".join(blocks)
 
     def _on_replay_clicked(self) -> None:
         if not self._on_replay_session:

@@ -146,3 +146,39 @@ async def test_replay_turn_captures_engine_error():
     turn = sr.Turn(kind="text", question="q", q_type="", original_answer="")
     result = await sr.replay_turn(engine, turn)
     assert result.error == "RuntimeError: boom"
+
+
+@pytest.mark.asyncio
+async def test_replay_turn_applies_prompt_overrides_and_restores():
+    """prompt_overrides should be visible inside the engine call and reverted after."""
+    from src import prompt_loader
+
+    original = prompt_loader.get_prompt("algorithm")
+    seen: list[str] = []
+
+    class _PeekEngine(_StubEngine):
+        async def generate_answer_stream(self, question, ui_queue, *, q_type=None):
+            # Snapshot the override-visible prompt mid-call.
+            seen.append(prompt_loader.get_prompt("algorithm"))
+            await ui_queue.put({"type": "token", "text": "ok"})
+
+    turn = sr.Turn(kind="text", question="q", q_type="algorithm", original_answer="")
+    result = await sr.replay_turn(
+        _PeekEngine(), turn, prompt_overrides={"algorithm": "OVERRIDE-X"}
+    )
+    assert result.error is None
+    assert seen == ["OVERRIDE-X"]
+    # Cache restored after the call.
+    assert prompt_loader.get_prompt("algorithm") == original
+
+
+@pytest.mark.asyncio
+async def test_replay_turn_restores_prompt_on_engine_error():
+    from src import prompt_loader
+
+    original = prompt_loader.get_prompt("algorithm")
+    engine = _StubEngine(raises=RuntimeError("nope"))
+    turn = sr.Turn(kind="text", question="q", q_type="algorithm", original_answer="")
+    result = await sr.replay_turn(engine, turn, prompt_overrides={"algorithm": "Y"})
+    assert result.error and "nope" in result.error
+    assert prompt_loader.get_prompt("algorithm") == original
