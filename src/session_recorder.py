@@ -172,7 +172,8 @@ class SessionRecorder:
             if self._llm_f is not None:
                 self._llm_f.write(json.dumps(
                     {"t": time.time(), "role": "screenshot",
-                     "path": str(out.relative_to(self._dir))},
+                     # Always forward-slash so replays load on every OS.
+                     "path": out.relative_to(self._dir).as_posix()},
                     ensure_ascii=False,
                 ) + "\n")
                 self._llm_f.flush()
