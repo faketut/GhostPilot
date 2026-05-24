@@ -7,6 +7,7 @@ the `prompts/` directory via PromptLoader.
 Text route  → DeepSeek-V3 (or any OpenAI-compatible model)
 Vision route → GPT-4o (or any vision-capable model)
 """
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -393,13 +394,14 @@ class LLMEngine:
                     await ui_queue.put({"type": "token", "text": delta.text})
                 if delta.usage:
                     self.last_usage["text"] = delta.usage
+                    _used = getattr(self.text_provider, "last_used", self.text_provider)
                     await ui_queue.put({"type": "usage", "kind": "text",
                                         "in": delta.usage.in_tokens,
                                         "out": delta.usage.out_tokens,
                                         "model": config.TEXT_MODEL,
                                         "total_ms": int((time.monotonic() - _t0) * 1000),
                                         "ttft_ms": _ttft_ms,
-                                        "provider": getattr(self.text_provider, "name", "?")})
+                                        "provider": getattr(_used, "name", "?")})
 
         except asyncio.CancelledError:
             logger.info("Text stream cancelled.")

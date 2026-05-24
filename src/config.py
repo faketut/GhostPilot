@@ -75,6 +75,10 @@ class Config:
     # When empty, the engine infers from the model name.
     TEXT_PROVIDER = os.getenv("TEXT_PROVIDER", "")
     VISION_PROVIDER = os.getenv("VISION_PROVIDER", "")
+    # Optional comma-separated fallback chain — used if the primary provider
+    # raises before emitting any output. Example: "deepseek,gemini".
+    TEXT_PROVIDER_FALLBACK = os.getenv("TEXT_PROVIDER_FALLBACK", "")
+    VISION_PROVIDER_FALLBACK = os.getenv("VISION_PROVIDER_FALLBACK", "")
     # Ollama (local OpenAI-compatible endpoint).
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
     # Multi-turn context: number of prior (Q, A) pairs to feed back to the

@@ -46,6 +46,7 @@ HIDDEN_IMPORTS = [
     "PyQt6.QtCore",
     "PyQt6.QtGui",
     "PyQt6.QtWidgets",
+    "qtawesome",
     "mss",
     "PIL",
     "PIL.Image",
@@ -127,6 +128,10 @@ def build(name: str, onefile: bool, use_upx: bool):
     # Hidden imports
     for hi in HIDDEN_IMPORTS:
         cmd += ["--hidden-import", hi]
+
+    # Packages whose data files (fonts, json mappings, etc.) must be bundled.
+    for pkg in ["qtawesome"]:
+        cmd += ["--collect-data", pkg]
 
     # UPX compression (reduces exe size by ~40%)
     if not use_upx:

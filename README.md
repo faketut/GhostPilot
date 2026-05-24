@@ -93,6 +93,20 @@ Provider is inferred from `TEXT_MODEL` but can be forced via `TEXT_PROVIDER`:
 
 Vision provider similarly via `VISION_PROVIDER` (`gemini` / `openai`).
 
+#### Provider failover (optional)
+
+Set `TEXT_PROVIDER_FALLBACK` and/or `VISION_PROVIDER_FALLBACK` to a
+comma-separated chain. If the primary provider raises **before** emitting any
+tokens (rate-limit, network error, etc.), the engine transparently retries
+against the next provider in the chain.
+
+```
+TEXT_PROVIDER=openai
+TEXT_PROVIDER_FALLBACK=deepseek,gemini
+```
+
+Mid-stream errors are *not* retried (the user has already seen partial text).
+
 ### Multi-turn context & vision history
 
 - `CONTEXT_TURNS` (default `0`) — number of prior (Q, A) pairs fed back to the text model.
