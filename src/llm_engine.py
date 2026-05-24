@@ -520,23 +520,24 @@ class LLMEngine:
             logger.warning("Vision step A (Gemini) JSON parse failed: %s", e)
             return "technical", ""
 
-    async def _vision_step_b_openai(
-        self, compressed: bytes, q_type: str, visible_question: str, ui_queue: asyncio.Queue
-    ):
-        rag_q = visible_question.strip() or "interview screenshot"
-        snippets, algo_blob = self._gather_context(q_type, rag_q)
-        base = self._build_interview_messages(
-            q_type,
-            rag_q,
-            snippets,
-            algo_blob,
-            vision_mode=True,
-            visible_question=visible_question,
-        )
-        system_prompt = base[0]["content"]
-        user_text = base[1]["content"]
+    def _build_vision_payload(self, system_prompt: str, user_text: str, compressed: bytes):
+        """Return a payload shaped for the active vision provider family.
+
+        Vision providers don't share a payload format (gemini takes a list of
+        parts; openai-compat takes a chat-style messages list). So we build
+        the right shape here based on provider name. Failover between
+        different families will fail at request time; see README.
+        """
+        name = (getattr(self.vision_provider, "name", "") or self._vision_provider or "").lower()
+        if "gemini" in name:
+            from google.genai import types
+            return [
+                user_text,
+                types.Part.from_bytes(data=compressed, mime_type="image/jpeg"),
+            ]
+        # OpenAI-compatible (incl. fallbacks)
         b64 = base64.b64encode(compressed).decode("utf-8")
-        messages = [
+        return [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
@@ -552,31 +553,11 @@ class LLMEngine:
                 ],
             },
         ]
-        stream = await self.vision_client.chat.completions.create(
-            model=config.VISION_MODEL,
-            messages=messages,
-            stream=True,
-            max_tokens=550,
-            temperature=0.25,
-        )
-        try:
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta is not None:
-                    await ui_queue.put({"type": "token", "text": delta})
-        finally:
-            try:
-                await stream.close()
-            except Exception:
-                pass
 
-    async def _vision_step_b_gemini(
-        self, compressed: bytes, q_type: str, visible_question: str, ui_queue: asyncio.Queue
+    async def _vision_step_b(
+        self, compressed: bytes, q_type: str, visible_question: str, ui_queue: asyncio.Queue,
     ):
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
+        """Unified vision step B that routes through self.vision_provider."""
         rag_q = visible_question.strip() or "interview screenshot"
         snippets, algo_blob = self._gather_context(q_type, rag_q)
         base = self._build_interview_messages(
@@ -589,32 +570,33 @@ class LLMEngine:
         )
         system_prompt = base[0]["content"]
         user_text = base[1]["content"]
-        gemini_config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            max_output_tokens=550,
+        payload = self._build_vision_payload(system_prompt, user_text, compressed)
+
+        # Wire failover hook so vision switches are visible in the footer.
+        def _on_failover(prev, nxt, err):
+            try:
+                ui_queue.put_nowait({
+                    "type": "info",
+                    "kind": "vision",
+                    "provider": getattr(nxt, "name", "?"),
+                    "note": f"failover from {getattr(prev, 'name', '?')}",
+                    "error": str(err)[:120],
+                })
+            except Exception:
+                pass
+        if hasattr(self.vision_provider, "on_failover"):
+            self.vision_provider.on_failover = _on_failover
+
+        agen = self.vision_provider.vision_stream(
+            payload,
+            model=config.VISION_MODEL,
+            system_prompt=system_prompt,
+            max_tokens=550,
             temperature=0.25,
         )
-        stream = await client.aio.models.generate_content_stream(
-            model=config.VISION_MODEL,
-            contents=[
-                user_text,
-                types.Part.from_bytes(data=compressed, mime_type="image/jpeg"),
-            ],
-            config=gemini_config,
-        )
-        try:
-            async for chunk in stream:
-                if chunk.text:
-                    await ui_queue.put({"type": "token", "text": chunk.text})
-        finally:
-            close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
-            if close is not None:
-                try:
-                    res = close()
-                    if asyncio.iscoroutine(res):
-                        await res
-                except Exception:
-                    pass
+        async for delta in agen:
+            if delta.text:
+                await ui_queue.put({"type": "token", "text": delta.text})
 
     async def generate_vision_answer_stream(
         self, image_bytes: bytes, ui_queue: asyncio.Queue
@@ -656,10 +638,7 @@ class LLMEngine:
 
             logger.info("Vision step A: type=%s visible_question_len=%d", q_type, len(visible_question))
 
-            if self._vision_provider == "gemini":
-                await self._vision_step_b_gemini(compressed, q_type, visible_question, ui_queue)
-            else:
-                await self._vision_step_b_openai(compressed, q_type, visible_question, ui_queue)
+            await self._vision_step_b(compressed, q_type, visible_question, ui_queue)
 
             # Record entry on successful completion (Phase 3.2).
             if self._vision_history.maxlen:

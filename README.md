@@ -108,9 +108,12 @@ TEXT_PROVIDER_FALLBACK=deepseek,gemini
 
 Mid-stream errors are *not* retried (the user has already seen partial text).
 
-> **Vision caveat:** the vision pipeline still calls raw provider SDKs
-> directly, so `VISION_PROVIDER_FALLBACK` is wired in the factory but does
-> not actually take effect at request time yet. Tracked for a future release.
+> **Vision caveat:** vision payloads differ between provider families (gemini
+> takes parts; openai-compat takes chat messages). The engine builds the
+> payload for the *primary* provider, so vision failover only works between
+> providers of the **same family** (e.g. `openai → deepseek`, both
+> openai-compatible). A cross-family fallback chain will error at request
+> time on the fallback provider.
 
 ### Usage log (cost & latency history)
 
