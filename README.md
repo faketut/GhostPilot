@@ -1,5 +1,7 @@
 # GhostPilot
 
+> **Status:** feature-complete for personal use (v0.9.0). Maintained on demand — no scheduled roadmap.
+
 Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LLM** + **Alt+P screenshot → multimodal LLM**, with a local **hybrid RAG knowledge base**.
 
 ## What's new in v0.8.0
