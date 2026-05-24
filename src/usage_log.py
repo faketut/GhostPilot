@@ -56,3 +56,46 @@ def read_usage(path: Optional[Path] = None) -> list[dict]:
     except Exception as e:  # noqa: BLE001
         logger.warning("usage_log read failed: %s", e)
     return out
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round((pct / 100.0) * (len(s) - 1)))))
+    return float(s[k])
+
+
+def summarize(events: list[dict]) -> dict:
+    """Aggregate counts + token totals + latency percentiles by provider."""
+    total_in = 0
+    total_out = 0
+    latencies: list[float] = []
+    by_provider: dict[str, dict] = {}
+    for e in events:
+        in_t = int(e.get("in") or 0)
+        out_t = int(e.get("out") or 0)
+        total_in += in_t
+        total_out += out_t
+        ms = e.get("total_ms")
+        if isinstance(ms, (int, float)):
+            latencies.append(float(ms))
+        prov = str(e.get("provider") or "?")
+        bp = by_provider.setdefault(prov, {"n": 0, "in": 0, "out": 0, "ms": []})
+        bp["n"] += 1
+        bp["in"] += in_t
+        bp["out"] += out_t
+        if isinstance(ms, (int, float)):
+            bp["ms"].append(float(ms))
+    for prov, bp in by_provider.items():
+        ms = bp.pop("ms")
+        bp["p50_ms"] = int(_percentile(ms, 50))
+        bp["p95_ms"] = int(_percentile(ms, 95))
+    return {
+        "n": len(events),
+        "total_in": total_in,
+        "total_out": total_out,
+        "p50_ms": int(_percentile(latencies, 50)),
+        "p95_ms": int(_percentile(latencies, 95)),
+        "by_provider": by_provider,
+    }

@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from src.usage_log import log_usage, read_usage
+from src.usage_log import log_usage, read_usage, summarize
 
 
 def test_log_usage_appends_json_lines(tmp_path):
@@ -56,3 +56,50 @@ def test_read_usage_skips_invalid_lines(tmp_path):
     p.write_text('{"good": 1}\nnot-json\n{"good": 2}\n', encoding="utf-8")
     events = read_usage(path=p)
     assert [e["good"] for e in events] == [1, 2]
+
+
+def test_summarize_empty_returns_zeros():
+    s = summarize([])
+    assert s["n"] == 0
+    assert s["total_in"] == 0
+    assert s["total_out"] == 0
+    assert s["p50_ms"] == 0
+    assert s["p95_ms"] == 0
+    assert s["by_provider"] == {}
+
+
+def test_summarize_aggregates_tokens_and_latency():
+    events = [
+        {"in": 10, "out": 5, "total_ms": 100, "provider": "openai"},
+        {"in": 20, "out": 8, "total_ms": 200, "provider": "openai"},
+        {"in": 0, "out": 0, "total_ms": 400, "provider": "deepseek"},
+    ]
+    s = summarize(events)
+    assert s["n"] == 3
+    assert s["total_in"] == 30
+    assert s["total_out"] == 13
+    assert s["p50_ms"] == 200  # middle of [100, 200, 400]
+    assert s["p95_ms"] == 400
+
+    openai = s["by_provider"]["openai"]
+    assert openai["n"] == 2
+    assert openai["in"] == 30 and openai["out"] == 13
+    # Nearest-rank p50 on [100, 200] picks the lower → 100
+    assert openai["p50_ms"] in (100, 200)
+    assert openai["p95_ms"] == 200
+
+    deepseek = s["by_provider"]["deepseek"]
+    assert deepseek["n"] == 1
+    assert deepseek["p50_ms"] == 400
+
+
+def test_summarize_handles_missing_fields():
+    """Vision latency events lack in/out tokens — must not crash."""
+    events = [
+        {"total_ms": 700, "provider": "gemini", "kind": "vision"},
+        {"provider": "gemini"},  # no latency either
+    ]
+    s = summarize(events)
+    assert s["n"] == 2
+    assert s["total_in"] == 0 and s["total_out"] == 0
+    assert s["p50_ms"] == 700

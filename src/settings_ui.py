@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QTabWidget, QWidget,
     QLineEdit, QPushButton, QMessageBox, QLabel, QToolButton,
     QHBoxLayout, QComboBox, QPlainTextEdit, QListWidget, QListWidgetItem,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction
@@ -24,6 +25,7 @@ from src import theme
 from src import icons
 from src import settings_tests
 from src import prompt_loader
+from src import usage_log
 
 logger = logging.getLogger(__name__)
 
@@ -318,6 +320,9 @@ class SettingsUI(QDialog):
         # ── Tab: Prompts (issue #10 in plan) ──
         tabs.addTab(self._build_prompts_tab(), icons.icon("edit"), "Prompts")
 
+        # ── Tab: Usage (cost & latency history) ──
+        tabs.addTab(self._build_usage_tab(), icons.icon("chart"), "Usage")
+
         root.addWidget(tabs, 1)
 
         # ── Provider-scoped row visibility ──
@@ -454,6 +459,90 @@ class SettingsUI(QDialog):
         if self._prompt_list.count() > 0:
             self._prompt_list.setCurrentRow(0)
         return w
+
+    # ── Usage tab ───────────────────────────────────────────────────────
+    def _build_usage_tab(self) -> QWidget:
+        from pathlib import Path
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        self._usage_summary = QLabel("")
+        self._usage_summary.setStyleSheet("font-size:12px; color:#cfd;")
+        self._usage_summary.setWordWrap(True)
+        v.addWidget(self._usage_summary)
+
+        self._usage_path_lbl = QLabel("")
+        self._usage_path_lbl.setStyleSheet("color:#9aa; font-size:11px;")
+        self._usage_path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self._usage_path_lbl)
+
+        self._usage_table = QTableWidget(0, 6)
+        self._usage_table.setHorizontalHeaderLabels(
+            ["When", "Kind", "Provider", "In", "Out", "Total ms"]
+        )
+        self._usage_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self._usage_table.verticalHeader().setVisible(False)
+        self._usage_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        v.addWidget(self._usage_table, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        refresh_btn = QPushButton("Refresh")
+        _set_btn_icon_or_text(refresh_btn, "refresh", keep_text=True)
+        refresh_btn.clicked.connect(self._refresh_usage)
+        btn_row.addWidget(refresh_btn)
+        v.addLayout(btn_row)
+
+        self._refresh_usage()
+        return w
+
+    def _refresh_usage(self) -> None:
+        from datetime import datetime
+        path = (
+            __import__("pathlib").Path(config.USAGE_LOG_PATH).expanduser()
+            if getattr(config, "USAGE_LOG_PATH", "")
+            else usage_log.default_path()
+        )
+        events = usage_log.read_usage(path=path)
+        s = usage_log.summarize(events)
+        self._usage_path_lbl.setText(f"Log file: {path}")
+        if not events:
+            self._usage_summary.setText("No usage events recorded yet.")
+            self._usage_table.setRowCount(0)
+            return
+        summary = (
+            f"<b>{s['n']}</b> requests · "
+            f"in <b>{s['total_in']:,}</b> tok · out <b>{s['total_out']:,}</b> tok · "
+            f"p50 <b>{s['p50_ms']}</b> ms · p95 <b>{s['p95_ms']}</b> ms"
+        )
+        by_prov = " · ".join(
+            f"{p}: {b['n']} ({b['in']}/{b['out']}, p50 {b['p50_ms']}ms)"
+            for p, b in s["by_provider"].items()
+        )
+        self._usage_summary.setText(summary + ("<br><span style='color:#9aa'>" + by_prov + "</span>" if by_prov else ""))
+
+        recent = events[-50:]
+        self._usage_table.setRowCount(len(recent))
+        for i, e in enumerate(reversed(recent)):
+            ts = e.get("ts", 0)
+            try:
+                when = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            except Exception:
+                when = "?"
+            cells = [
+                when,
+                str(e.get("kind") or e.get("type") or "?"),
+                str(e.get("provider") or "?"),
+                str(e.get("in") or ""),
+                str(e.get("out") or ""),
+                str(e.get("total_ms") or ""),
+            ]
+            for col, val in enumerate(cells):
+                self._usage_table.setItem(i, col, QTableWidgetItem(val))
 
     def _current_prompt_name(self) -> str | None:
         it = self._prompt_list.currentItem()

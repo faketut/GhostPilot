@@ -40,6 +40,7 @@ _NAMES = {
     "edit":         ("fa5s.edit",            "📝"),
     "record":       ("fa5s.circle",          "●"),
     "language":     ("fa5s.globe",           "🌐"),
+    "chart":        ("fa5s.chart-bar",       "📊"),
 }
 
 
