@@ -375,6 +375,9 @@ class LLMEngine:
             messages = [messages[0], *history_msgs, messages[1]]
 
         full_answer_parts: list[str] = []
+        import time
+        _t0 = time.monotonic()
+        _ttft_ms: int | None = None
         try:
             agen = self.text_provider.chat_stream(
                 messages,
@@ -384,6 +387,8 @@ class LLMEngine:
             )
             async for delta in agen:
                 if delta.text:
+                    if _ttft_ms is None:
+                        _ttft_ms = int((time.monotonic() - _t0) * 1000)
                     full_answer_parts.append(delta.text)
                     await ui_queue.put({"type": "token", "text": delta.text})
                 if delta.usage:
@@ -391,7 +396,10 @@ class LLMEngine:
                     await ui_queue.put({"type": "usage", "kind": "text",
                                         "in": delta.usage.in_tokens,
                                         "out": delta.usage.out_tokens,
-                                        "model": config.TEXT_MODEL})
+                                        "model": config.TEXT_MODEL,
+                                        "total_ms": int((time.monotonic() - _t0) * 1000),
+                                        "ttft_ms": _ttft_ms,
+                                        "provider": getattr(self.text_provider, "name", "?")})
 
         except asyncio.CancelledError:
             logger.info("Text stream cancelled.")
@@ -593,6 +601,8 @@ class LLMEngine:
         if cur is not None:
             self.register_task("vision", cur)
         logger.info("Vision answer requested (two-step).")
+        import time
+        _vt0 = time.monotonic()
         try:
             compressed = self._compress_jpeg(image_bytes)
             logger.info(
@@ -629,6 +639,17 @@ class LLMEngine:
             if self._vision_history.maxlen:
                 import time
                 self._vision_history.append((time.time(), compressed, visible_question, ""))
+
+            # Latency telemetry for the vision pipeline.
+            try:
+                await ui_queue.put({
+                    "type": "latency",
+                    "kind": "vision",
+                    "total_ms": int((time.monotonic() - _vt0) * 1000),
+                    "provider": getattr(self.vision_provider, "name", self._vision_provider),
+                })
+            except Exception:
+                pass
 
         except asyncio.CancelledError:
             logger.info("Vision stream cancelled.")
