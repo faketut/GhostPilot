@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import types
 from collections import deque
-from unittest.mock import AsyncMock
 
 import pytest
 

@@ -9,6 +9,7 @@ without a restart.
 import json
 import os
 import logging
+from pathlib import Path
 from typing import Callable, Optional
 
 from PyQt6.QtWidgets import (
@@ -462,7 +463,6 @@ class SettingsUI(QDialog):
 
     # ── Usage tab ───────────────────────────────────────────────────────
     def _build_usage_tab(self) -> QWidget:
-        from pathlib import Path
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(8, 8, 8, 8)
@@ -503,7 +503,7 @@ class SettingsUI(QDialog):
     def _refresh_usage(self) -> None:
         from datetime import datetime
         path = (
-            __import__("pathlib").Path(config.USAGE_LOG_PATH).expanduser()
+            Path(config.USAGE_LOG_PATH).expanduser()
             if getattr(config, "USAGE_LOG_PATH", "")
             else usage_log.default_path()
         )

@@ -193,17 +193,13 @@ class LLMEngine:
         # Last observed usage per pipeline (consumed by Phase 2.3 token counter).
         self.last_usage: dict[str, Usage] = {}
 
-        # ── Legacy clients kept for vision helpers (still call raw SDKs) ──
+        # ── Legacy raw-SDK client kept only for vision step A (OpenAI family) ──
+        # The streaming text path and vision step B both go through the provider
+        # abstraction now; only `_vision_step_a_openai` still calls the OpenAI
+        # SDK directly because it needs a one-shot JSON response. Routing it
+        # through the provider abstraction is tracked as future work.
         def _is_deepseek(m: str) -> bool:
             return "deepseek" in (m or "").lower()
-
-        if _is_deepseek(config.TEXT_MODEL):
-            self.text_client = AsyncOpenAI(
-                api_key=config.DEEPSEEK_API_KEY,
-                base_url="https://api.deepseek.com/v1",
-            )
-        else:
-            self.text_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 
         vm = (config.VISION_MODEL or "").lower()
         self.vision_client = None

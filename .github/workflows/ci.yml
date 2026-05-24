@@ -46,7 +46,6 @@ jobs:
 
       - name: Lint (ruff)
         run: ruff check . --output-format=github
-        continue-on-error: true
 
       - name: Run tests
         run: pytest -q

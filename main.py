@@ -392,7 +392,7 @@ async def run_pipelines(app, loop):
                 await asyncio.sleep(interval)
 
     if not _install_kb_watcher():
-        kb_watch_task = loop.create_task(_kb_poll_loop())
+        loop.create_task(_kb_poll_loop())
 
     # ── Hotkey: Alt+P — area-select screenshot → Vision LLM ──────────────
     async def on_screenshot():

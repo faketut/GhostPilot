@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from src.usage_log import log_usage, read_usage, summarize
 
