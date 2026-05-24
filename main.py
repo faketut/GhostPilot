@@ -289,6 +289,34 @@ async def run_pipelines(app, loop):
             logger.error(f"Runtime settings apply failed: {e}")
 
     # Create overlays after we have the callback
+    def _start_replay(path):
+        """Kick off a non-blocking replay of `path` through the live engine.
+
+        Re-runs every recorded turn while a fresh SessionRecorder captures the
+        results, so the user can compare old vs new by opening the new
+        recording in the Sessions tab.
+        """
+        from src import session_replay
+        from src.session_recorder import recorder as _rec
+
+        async def _run():
+            sdir = session_replay.open_session(path)
+            turns = list(session_replay.iter_turns(sdir))
+            if not turns:
+                return
+            _rec.start()
+            try:
+                for turn in turns:
+                    try:
+                        await session_replay.replay_turn(llm_engine, turn)
+                    except Exception as e:
+                        logger.warning("Replay turn failed: %s", e)
+            finally:
+                out = _rec.stop()
+                logger.info("Replay finished → %s", out)
+
+        loop.create_task(_run())
+
     ui_asr = OverlayUI(
         title="GhostPilot · ASR",
         with_tray=True,
@@ -299,6 +327,7 @@ async def run_pipelines(app, loop):
         on_stop=lambda: llm_engine.cancel("text"),
         on_clear=llm_engine.clear_history,
         on_rebuild_kb=rebuild_kb,
+        on_replay_session=_start_replay,
     )
     ui_vision = OverlayUI(
         title="GhostPilot · Vision",

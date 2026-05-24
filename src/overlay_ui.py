@@ -296,6 +296,7 @@ class OverlayUI(QMainWindow):
         on_stop=None,
         on_clear=None,
         on_rebuild_kb=None,
+        on_replay_session=None,
     ):
         super().__init__()
         self.is_interactive = True   # toggled by Alt+A
@@ -309,6 +310,7 @@ class OverlayUI(QMainWindow):
         self._on_stop = on_stop
         self._on_clear = on_clear
         self._on_rebuild_kb = on_rebuild_kb
+        self._on_replay_session = on_replay_session
         self._geometry_key = geometry_key
         self._hotkey_hint = hotkey_hint
         self._status_flash_timer: Optional[QTimer] = None
@@ -555,7 +557,8 @@ class OverlayUI(QMainWindow):
                 self._flash_bottom_status("Recording failed to start", duration_ms=2000)
 
     def _open_settings(self):
-        dlg = SettingsUI(self, on_saved=self._on_settings_saved, on_rebuild_kb=self._on_rebuild_kb)
+        dlg = SettingsUI(self, on_saved=self._on_settings_saved, on_rebuild_kb=self._on_rebuild_kb,
+                         on_replay_session=self._on_replay_session)
         dlg.exec()
 
     # ── Public API ────────────────────────────────────────────────────────

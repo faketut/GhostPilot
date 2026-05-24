@@ -141,7 +141,8 @@ _ASR_BACKEND_OPTIONS = [
 
 class SettingsUI(QDialog):
     def __init__(self, parent=None, *, on_saved: Optional[Callable[[dict], None]] = None,
-                 on_rebuild_kb: Optional[Callable[[], int]] = None):
+                 on_rebuild_kb: Optional[Callable[[], int]] = None,
+                 on_replay_session: Optional[Callable[[Path], None]] = None):
         super().__init__(parent)
         self.setWindowTitle("GhostPilot Copilot — Settings")
         self.setMinimumWidth(520)
@@ -153,6 +154,7 @@ class SettingsUI(QDialog):
 
         self._on_saved = on_saved
         self._on_rebuild_kb = on_rebuild_kb
+        self._on_replay_session = on_replay_session
         self.saved_config = self._load_config()
         # Layer keyring values on top so the form pre-fills with current secrets.
         try:
@@ -323,6 +325,9 @@ class SettingsUI(QDialog):
 
         # ── Tab: Usage (cost & latency history) ──
         tabs.addTab(self._build_usage_tab(), icons.icon("chart"), "Usage")
+
+        # ── Tab: Sessions (record/replay, v0.9.0) ──
+        tabs.addTab(self._build_sessions_tab(), icons.icon("record"), "Sessions")
 
         root.addWidget(tabs, 1)
 
@@ -543,6 +548,136 @@ class SettingsUI(QDialog):
             ]
             for col, val in enumerate(cells):
                 self._usage_table.setItem(i, col, QTableWidgetItem(val))
+
+    # ── Sessions tab ────────────────────────────────────────────────────
+    def _build_sessions_tab(self) -> QWidget:
+        from src import session_replay
+        from src.session_recorder import _recordings_root
+
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(8, 8, 8, 8)
+        h.setSpacing(8)
+
+        # Left: list of recordings (newest first).
+        self._sessions_list = QListWidget()
+        self._sessions_list.setMaximumWidth(220)
+        h.addWidget(self._sessions_list)
+
+        # Right: header + per-turn viewer + replay button.
+        right = QVBoxLayout()
+
+        self._sessions_summary = QLabel("Select a recording on the left.")
+        self._sessions_summary.setStyleSheet("font-size:12px; color:#cfd;")
+        self._sessions_summary.setWordWrap(True)
+        right.addWidget(self._sessions_summary)
+
+        self._sessions_view = QPlainTextEdit()
+        self._sessions_view.setReadOnly(True)
+        self._sessions_view.setStyleSheet(
+            "font-family: 'Menlo','Consolas',monospace; font-size:12px;"
+        )
+        right.addWidget(self._sessions_view, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        refresh_btn = QPushButton("Refresh")
+        _set_btn_icon_or_text(refresh_btn, "refresh", keep_text=True)
+        refresh_btn.clicked.connect(self._refresh_sessions)
+        btn_row.addWidget(refresh_btn)
+        self._replay_btn = QPushButton("Replay through current engine")
+        _set_btn_icon_or_text(self._replay_btn, "robot", keep_text=True)
+        self._replay_btn.setEnabled(False)
+        self._replay_btn.setToolTip(
+            "Re-runs every turn through the current LLM engine and records the "
+            "results as a new session. Compare by opening the new recording."
+        )
+        self._replay_btn.clicked.connect(self._on_replay_clicked)
+        btn_row.addWidget(self._replay_btn)
+        right.addLayout(btn_row)
+
+        rw = QWidget(); rw.setLayout(right)
+        h.addWidget(rw, 1)
+
+        # Cache state for the click handlers.
+        self._session_replay_mod = session_replay
+        self._recordings_root = _recordings_root()
+        self._session_paths: list[Path] = []
+
+        self._sessions_list.currentRowChanged.connect(self._on_session_selected)
+        self._refresh_sessions()
+        return w
+
+    def _refresh_sessions(self) -> None:
+        self._sessions_list.clear()
+        self._session_paths = []
+        root = self._recordings_root
+        if not root.exists():
+            self._sessions_summary.setText(f"No recordings under {root}")
+            self._sessions_view.setPlainText("")
+            self._replay_btn.setEnabled(False)
+            return
+
+        entries: list[Path] = []
+        for p in root.iterdir():
+            if p.is_dir() and (p / "llm.jsonl").exists():
+                entries.append(p)
+            elif p.suffix == ".zip" and p.is_file():
+                entries.append(p)
+        entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        if not entries:
+            self._sessions_summary.setText(f"No recordings found in {root}")
+            self._replay_btn.setEnabled(False)
+            return
+        for p in entries:
+            self._session_paths.append(p)
+            self._sessions_list.addItem(QListWidgetItem(p.name))
+        self._sessions_list.setCurrentRow(0)
+
+    def _on_session_selected(self, row: int) -> None:
+        if row < 0 or row >= len(self._session_paths):
+            return
+        path = self._session_paths[row]
+        try:
+            sdir = self._session_replay_mod.open_session(path)
+            turns = list(self._session_replay_mod.iter_turns(sdir))
+        except Exception as e:
+            self._sessions_summary.setText(f"Failed to open: {e}")
+            self._sessions_view.setPlainText("")
+            self._replay_btn.setEnabled(False)
+            return
+        self._sessions_summary.setText(
+            f"<b>{path.name}</b> · {len(turns)} turn(s)"
+        )
+        # Render the turns as plain text Q/A blocks.
+        blocks: list[str] = []
+        for i, t in enumerate(turns, 1):
+            tag = f"[{t.kind}/{t.q_type or '?'}]"
+            q = t.question.strip() or "(no transcript / vision-only)"
+            blocks.append(
+                f"── Turn {i} {tag} ──────────────────────────────\n"
+                f"Q: {q}\n\n"
+                f"A: {t.original_answer.strip() or '(empty)'}\n"
+            )
+        self._sessions_view.setPlainText("\n".join(blocks) or "(empty recording)")
+        self._replay_btn.setEnabled(bool(self._on_replay_session) and bool(turns))
+        self._current_session_path = path
+
+    def _on_replay_clicked(self) -> None:
+        if not self._on_replay_session:
+            return
+        path = getattr(self, "_current_session_path", None)
+        if path is None:
+            return
+        try:
+            self._on_replay_session(path)
+            self._sessions_summary.setText(
+                f"Replay scheduled for <b>{path.name}</b>. "
+                "Results will appear as a new recording — click Refresh when done."
+            )
+        except Exception as e:
+            self._sessions_summary.setText(f"Replay failed to start: {e}")
 
     def _current_prompt_name(self) -> str | None:
         it = self._prompt_list.currentItem()
