@@ -53,7 +53,8 @@ async def test_failover_uses_primary_when_healthy():
 async def test_failover_switches_when_primary_errors_before_emit():
     primary = _FakeProvider("primary", raises=RuntimeError("429"))
     fallback = _FakeProvider("fallback", deltas=[Delta(text="ok", usage=Usage(2, 3))])
-    fp = FailoverProvider(primary, [fallback])
+    # retries_per_provider=0 keeps this test focused on the *switch*, not the retry.
+    fp = FailoverProvider(primary, [fallback], retries_per_provider=0)
 
     chunks = [d async for d in fp.chat_stream([], model="m")]
     assert [c.text for c in chunks] == ["ok"]
@@ -127,3 +128,78 @@ async def test_failover_callback_silent_when_no_switch():
 
     _ = [d async for d in fp.chat_stream([], model="m")]
     assert fired == []
+
+
+# ── Error classification + backoff ─────────────────────────────────
+
+
+class _StatusError(Exception):
+    def __init__(self, msg: str, status_code: int):
+        super().__init__(msg)
+        self.status_code = status_code
+
+
+@pytest.mark.asyncio
+async def test_classify_fatal_4xx_does_not_failover():
+    """401/403/400/404 → raise immediately; never touch fallback."""
+    primary = _FakeProvider("primary", raises=_StatusError("Unauthorized", 401))
+    fallback = _FakeProvider("fallback", deltas=[Delta(text="should-not-run")])
+    fp = FailoverProvider(primary, [fallback])
+
+    with pytest.raises(_StatusError):
+        _ = [d async for d in fp.chat_stream([], model="m")]
+    assert primary.calls == 1  # no in-place retry on fatal either
+    assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_classify_retryable_429_triggers_in_place_retry(monkeypatch):
+    """429 → retry once on primary, then fail over to fallback."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+
+    import asyncio as _aio
+    monkeypatch.setattr(_aio, "sleep", fake_sleep)
+
+    primary = _FakeProvider("primary", raises=_StatusError("rate limit", 429))
+    fallback = _FakeProvider("fallback", deltas=[Delta(text="ok")])
+    fp = FailoverProvider(primary, [fallback], retries_per_provider=1, backoff_base=0.1)
+
+    chunks = [d async for d in fp.chat_stream([], model="m")]
+    assert [c.text for c in chunks] == ["ok"]
+    assert primary.calls == 2  # first attempt + 1 in-place retry
+    assert fallback.calls == 1
+    assert sleeps == [0.1]  # one backoff before retry
+
+
+@pytest.mark.asyncio
+async def test_classify_5xx_is_retryable():
+    primary = _FakeProvider("primary", raises=_StatusError("server boom", 503))
+    fallback = _FakeProvider("fallback", deltas=[Delta(text="ok")])
+    fp = FailoverProvider(primary, [fallback], retries_per_provider=0, backoff_base=0)
+    chunks = [d async for d in fp.chat_stream([], model="m")]
+    assert [c.text for c in chunks] == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_classify_fatal_in_chat_complete_propagates():
+    primary = _FakeProvider("primary", raises=_StatusError("bad request", 400))
+    fallback = _FakeProvider("fallback")
+    fp = FailoverProvider(primary, [fallback])
+    with pytest.raises(_StatusError):
+        await fp.chat_complete([], model="m")
+    assert fallback.calls == 0
+
+
+def test_classify_error_helper():
+    from src.llm.failover import classify_error
+
+    assert classify_error(_StatusError("x", 401)) == "fatal"
+    assert classify_error(_StatusError("x", 429)) == "retryable"
+    assert classify_error(_StatusError("x", 502)) == "retryable"
+    assert classify_error(TimeoutError("slow")) == "retryable"
+    assert classify_error(ConnectionError("net")) == "retryable"
+    assert classify_error(RuntimeError("Invalid API key")) == "fatal"
+    assert classify_error(RuntimeError("nothing to classify")) == "unknown"
