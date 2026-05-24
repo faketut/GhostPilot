@@ -85,3 +85,43 @@ def test_log_and_stop_produces_zip_with_records(isolated_recorder):
 
 def test_stop_without_start_returns_none(isolated_recorder):
     assert isolated_recorder.stop() is None
+
+
+def test_log_screenshot_before_start_is_noop(isolated_recorder):
+    out = isolated_recorder.log_screenshot(b"\xff\xd8\xff")
+    assert out is None
+
+
+def test_log_screenshot_writes_file_and_pointer(isolated_recorder):
+    d = isolated_recorder.start()
+    assert d is not None
+    p1 = isolated_recorder.log_screenshot(b"\xff\xd8\xff\x01")
+    p2 = isolated_recorder.log_screenshot(b"\xff\xd8\xff\x02")
+    assert p1 is not None and p1.exists()
+    assert p2 is not None and p2.exists()
+    assert p1.name == "0001.jpg" and p2.name == "0002.jpg"
+    assert p1.read_bytes() == b"\xff\xd8\xff\x01"
+    # llm.jsonl should now contain two screenshot pointer rows.
+    rows = [json.loads(ln) for ln in (d / "llm.jsonl").read_text().splitlines()]
+    shots = [r for r in rows if r.get("role") == "screenshot"]
+    assert len(shots) == 2
+    assert shots[0]["path"] == "screenshots/0001.jpg"
+
+
+def test_log_llm_persists_assistant_content(isolated_recorder):
+    """The answer text must round-trip — needed for replay (v0.9.0 #1)."""
+    d = isolated_recorder.start()
+    isolated_recorder.log_llm("assistant", "the full answer body",
+                              tokens_in=3, tokens_out=4, model="gpt-4o-mini")
+    rows = [json.loads(ln) for ln in (d / "llm.jsonl").read_text().splitlines()]
+    assert rows[0]["content"] == "the full answer body"
+    assert rows[0]["tokens_out"] == 4
+
+
+def test_screenshot_idx_resets_per_session(isolated_recorder):
+    isolated_recorder.start()
+    isolated_recorder.log_screenshot(b"a")
+    isolated_recorder.stop()
+    isolated_recorder.start()
+    p = isolated_recorder.log_screenshot(b"b")
+    assert p is not None and p.name == "0001.jpg"

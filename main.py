@@ -69,13 +69,19 @@ logger = logging.getLogger(__name__)
 
 async def ui_updater(ui, ui_queue: asyncio.Queue):
     """Consumes the UI queue and updates the PyQt window."""
+    # Per-task running buffer of the in-progress answer (Phase 5.4+).
+    # Reset on 'clear', flushed to the session recorder on 'usage' or
+    # 'latency' (the terminal events for text / vision pipelines).
+    answer_buf: list[str] = []
     while True:
         try:
             msg = await ui_queue.get()
             if msg["type"] == "token":
                 ui.update_text(msg["text"], append=True)
+                answer_buf.append(msg["text"])
             elif msg["type"] == "clear":
                 ui.update_text("", append=False)
+                answer_buf.clear()
             elif msg["type"] == "info":
                 # Observability strip (provider · rag:N)
                 try:
@@ -100,9 +106,11 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
                     ui.set_usage_footer(" · ".join(parts))
                     # Session recorder (Phase 5.4)
                     from src.session_recorder import recorder as _rec
-                    _rec.log_llm("assistant", "", tokens_in=msg.get("in", 0),
+                    _rec.log_llm("assistant", "".join(answer_buf),
+                                 tokens_in=msg.get("in", 0),
                                  tokens_out=msg.get("out", 0), cost_usd=c,
                                  model=msg.get("model", ""))
+                    answer_buf.clear()
                 except Exception:
                     pass
             elif msg["type"] == "latency":
@@ -111,6 +119,12 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
                     total_ms = int(msg.get("total_ms") or 0)
                     if total_ms > 0:
                         ui.set_usage_footer(f"{total_ms}ms")
+                    # Capture the vision answer text for replay too.
+                    from src.session_recorder import recorder as _rec
+                    if answer_buf:
+                        _rec.log_llm("assistant", "".join(answer_buf),
+                                     model=msg.get("model", ""))
+                    answer_buf.clear()
                 except Exception:
                     pass
         except asyncio.CancelledError:
@@ -409,6 +423,12 @@ async def run_pipelines(app, loop):
             if image_bytes is None:
                 logger.info("Screenshot capture cancelled by user.")
                 return
+            # Persist the screenshot to the active session (best-effort).
+            try:
+                from src.session_recorder import recorder as _rec
+                _rec.log_screenshot(image_bytes)
+            except Exception:
+                pass
             ui_vision.set_streaming(True)
             try:
                 await asyncio.wait_for(

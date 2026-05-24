@@ -42,6 +42,7 @@ class SessionRecorder:
         self._llm_f = None
         self._meta: dict[str, Any] = {}
         self._started_at: float = 0.0
+        self._screenshot_idx: int = 0
 
     def is_recording(self) -> bool:
         return self._dir is not None
@@ -58,6 +59,7 @@ class SessionRecorder:
                 self._llm_f = (d / "llm.jsonl").open("w", encoding="utf-8")
                 self._dir = d
                 self._started_at = time.time()
+                self._screenshot_idx = 0
                 # Snapshot config minus secrets.
                 try:
                     from src.config import config
@@ -137,6 +139,30 @@ class SessionRecorder:
             self._llm_f.flush()
         except Exception:
             pass
+
+    def log_screenshot(self, data: bytes, *, ext: str = "jpg") -> Path | None:
+        """Persist a screenshot under the active session dir and log a pointer
+        to it in ``llm.jsonl``. Returns the saved path, or None if not recording.
+        """
+        if self._dir is None:
+            return None
+        try:
+            self._screenshot_idx += 1
+            assets = self._dir / "screenshots"
+            assets.mkdir(parents=True, exist_ok=True)
+            out = assets / f"{self._screenshot_idx:04d}.{ext}"
+            out.write_bytes(data)
+            if self._llm_f is not None:
+                self._llm_f.write(json.dumps(
+                    {"t": time.time(), "role": "screenshot",
+                     "path": str(out.relative_to(self._dir))},
+                    ensure_ascii=False,
+                ) + "\n")
+                self._llm_f.flush()
+            return out
+        except Exception as e:
+            logger.warning("log_screenshot failed: %s", e)
+            return None
 
 
 # Singleton
