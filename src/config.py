@@ -79,6 +79,10 @@ class Config:
     # raises before emitting any output. Example: "deepseek,gemini".
     TEXT_PROVIDER_FALLBACK = os.getenv("TEXT_PROVIDER_FALLBACK", "")
     VISION_PROVIDER_FALLBACK = os.getenv("VISION_PROVIDER_FALLBACK", "")
+    # Append-only JSONL usage log. Empty path → ~/.ghostpilot/usage.jsonl.
+    USAGE_LOG_ENABLED = (os.getenv("USAGE_LOG_ENABLED", "1").strip().lower()
+                         not in {"0", "false", "no", ""})
+    USAGE_LOG_PATH = os.getenv("USAGE_LOG_PATH", "")
     # Ollama (local OpenAI-compatible endpoint).
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
     # Multi-turn context: number of prior (Q, A) pairs to feed back to the
