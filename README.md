@@ -95,10 +95,11 @@ Vision provider similarly via `VISION_PROVIDER` (`gemini` / `openai`).
 
 #### Provider failover (optional)
 
-Set `TEXT_PROVIDER_FALLBACK` and/or `VISION_PROVIDER_FALLBACK` to a
-comma-separated chain. If the primary provider raises **before** emitting any
-tokens (rate-limit, network error, etc.), the engine transparently retries
-against the next provider in the chain.
+Set `TEXT_PROVIDER_FALLBACK` (and/or `VISION_PROVIDER_FALLBACK`, see caveat
+below) to a comma-separated chain. If the primary provider raises **before**
+emitting any tokens (rate-limit, network error, etc.), the engine
+transparently retries against the next provider and flashes a footer note
+`failover from <prev>`.
 
 ```
 TEXT_PROVIDER=openai
@@ -106,6 +107,18 @@ TEXT_PROVIDER_FALLBACK=deepseek,gemini
 ```
 
 Mid-stream errors are *not* retried (the user has already seen partial text).
+
+> **Vision caveat:** the vision pipeline still calls raw provider SDKs
+> directly, so `VISION_PROVIDER_FALLBACK` is wired in the factory but does
+> not actually take effect at request time yet. Tracked for a future release.
+
+### Usage log (cost & latency history)
+
+Every text-`usage` and vision-`latency` event is appended as one JSON line to
+`~/.ghostpilot/usage.jsonl` (override with `USAGE_LOG_PATH`). Each record
+carries `ts`, `provider`, `model`, `in`/`out` token counts (text path),
+`total_ms`, and `ttft_ms` so you can post-hoc analyse spend and latency
+without re-instrumenting. Disable with `USAGE_LOG_ENABLED=0`.
 
 ### Multi-turn context & vision history
 
