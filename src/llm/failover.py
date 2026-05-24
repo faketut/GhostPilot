@@ -9,7 +9,7 @@ text).
 from __future__ import annotations
 
 import logging
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable, Optional
 
 from src.llm.base import Delta, LLMProvider, Usage
 
@@ -19,19 +19,29 @@ logger = logging.getLogger(__name__)
 class FailoverProvider(LLMProvider):
     """Wraps a primary `LLMProvider` plus an ordered list of fallbacks."""
 
-    def __init__(self, primary: LLMProvider, fallbacks: list[LLMProvider]):
+    def __init__(
+        self,
+        primary: LLMProvider,
+        fallbacks: list[LLMProvider],
+        on_failover: Optional[Callable[[LLMProvider, LLMProvider, Exception], None]] = None,
+    ):
         self.primary = primary
         self.fallbacks = list(fallbacks)
         self.name = primary.name
         # Tracks which provider served the most recent request.
         self.last_used: LLMProvider = primary
+        # Optional hook fired when a switch happens (prev, next, error).
+        self.on_failover = on_failover
 
     def _chain(self) -> list[LLMProvider]:
         return [self.primary, *self.fallbacks]
 
     async def chat_complete(self, messages, *, model, max_tokens=256, temperature=0.1) -> str:
         last_err: Exception | None = None
+        prev: LLMProvider | None = None
         for prov in self._chain():
+            if prev is not None and last_err is not None:
+                self._notify(prev, prov, last_err)
             try:
                 self.last_used = prov
                 return await prov.chat_complete(
@@ -39,15 +49,27 @@ class FailoverProvider(LLMProvider):
                 )
             except Exception as e:  # noqa: BLE001
                 last_err = e
+                prev = prov
                 logger.warning("Provider %s failed (chat_complete): %s — trying next", prov.name, e)
         assert last_err is not None
         raise last_err
+
+    def _notify(self, prev: LLMProvider, nxt: LLMProvider, err: Exception) -> None:
+        if self.on_failover is None:
+            return
+        try:
+            self.on_failover(prev, nxt, err)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_failover callback raised; ignoring")
 
     async def _stream_with_failover(
         self, method: str, *args, **kwargs,
     ) -> AsyncIterator[Delta]:
         last_err: Exception | None = None
+        prev: LLMProvider | None = None
         for prov in self._chain():
+            if prev is not None and last_err is not None:
+                self._notify(prev, prov, last_err)
             self.last_used = prov
             gen = getattr(prov, method)(*args, **kwargs)
             emitted = False
@@ -58,6 +80,7 @@ class FailoverProvider(LLMProvider):
                 return  # finished cleanly
             except Exception as e:  # noqa: BLE001
                 last_err = e
+                prev = prov
                 if emitted:
                     # Already streamed text — don't restart on a different provider.
                     logger.warning("Provider %s failed mid-stream: %s — propagating", prov.name, e)

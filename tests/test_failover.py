@@ -101,3 +101,29 @@ async def test_failover_raises_last_error_when_all_fail():
 
     with pytest.raises(RuntimeError, match="f1-err"):
         await fp.chat_complete([], model="m")
+
+
+@pytest.mark.asyncio
+async def test_failover_callback_fires_with_prev_next_error():
+    primary = _FakeProvider("primary", raises=RuntimeError("429"))
+    fallback = _FakeProvider("fallback", deltas=[Delta(text="ok")])
+    events: list[tuple[str, str, str]] = []
+    fp = FailoverProvider(
+        primary,
+        [fallback],
+        on_failover=lambda prev, nxt, err: events.append((prev.name, nxt.name, str(err))),
+    )
+
+    _ = [d async for d in fp.chat_stream([], model="m")]
+    assert events == [("primary", "fallback", "429")]
+
+
+@pytest.mark.asyncio
+async def test_failover_callback_silent_when_no_switch():
+    primary = _FakeProvider("primary", deltas=[Delta(text="hi")])
+    fallback = _FakeProvider("fallback")
+    fired: list = []
+    fp = FailoverProvider(primary, [fallback], on_failover=lambda *a: fired.append(a))
+
+    _ = [d async for d in fp.chat_stream([], model="m")]
+    assert fired == []

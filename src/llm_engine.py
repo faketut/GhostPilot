@@ -24,6 +24,7 @@ from src.config import config
 from src.rag_manager import RAGManager
 from src.prompt_loader import get_prompt
 from src.llm import make_text_provider, make_vision_provider, Usage
+from src.usage_log import log_usage
 
 logger = logging.getLogger(__name__)
 
@@ -350,9 +351,9 @@ class LLMEngine:
         logger.info("[%s] %s", q_type.upper(), question)
 
         snippets, algo_blob = self._gather_context(q_type, question)
+        rag_hits = len(snippets) + (1 if algo_blob else 0)
         # Observability: notify UI of provider + RAG hit count before stream starts.
         try:
-            rag_hits = len(snippets) + (1 if algo_blob else 0)
             await ui_queue.put({
                 "type": "info",
                 "provider": getattr(self.text_provider, "name", "?"),
@@ -380,6 +381,20 @@ class LLMEngine:
         _t0 = time.monotonic()
         _ttft_ms: int | None = None
         try:
+            # Wire failover hook so the UI sees provider switches.
+            def _on_failover(prev, nxt, err):
+                try:
+                    ui_queue.put_nowait({
+                        "type": "info",
+                        "provider": getattr(nxt, "name", "?"),
+                        "note": f"failover from {getattr(prev, 'name', '?')}",
+                        "error": str(err)[:120],
+                        "rag_hits": rag_hits,
+                    })
+                except Exception:
+                    pass
+            if hasattr(self.text_provider, "on_failover"):
+                self.text_provider.on_failover = _on_failover
             agen = self.text_provider.chat_stream(
                 messages,
                 model=config.TEXT_MODEL,
@@ -395,13 +410,22 @@ class LLMEngine:
                 if delta.usage:
                     self.last_usage["text"] = delta.usage
                     _used = getattr(self.text_provider, "last_used", self.text_provider)
-                    await ui_queue.put({"type": "usage", "kind": "text",
-                                        "in": delta.usage.in_tokens,
-                                        "out": delta.usage.out_tokens,
-                                        "model": config.TEXT_MODEL,
-                                        "total_ms": int((time.monotonic() - _t0) * 1000),
-                                        "ttft_ms": _ttft_ms,
-                                        "provider": getattr(_used, "name", "?")})
+                    _payload = {"type": "usage", "kind": "text",
+                                "in": delta.usage.in_tokens,
+                                "out": delta.usage.out_tokens,
+                                "model": config.TEXT_MODEL,
+                                "total_ms": int((time.monotonic() - _t0) * 1000),
+                                "ttft_ms": _ttft_ms,
+                                "provider": getattr(_used, "name", "?")}
+                    await ui_queue.put(_payload)
+                    try:
+                        log_usage(
+                            _payload,
+                            path=Path(config.USAGE_LOG_PATH) if config.USAGE_LOG_PATH else None,
+                            enabled=config.USAGE_LOG_ENABLED,
+                        )
+                    except Exception:
+                        pass
 
         except asyncio.CancelledError:
             logger.info("Text stream cancelled.")
@@ -644,12 +668,21 @@ class LLMEngine:
 
             # Latency telemetry for the vision pipeline.
             try:
-                await ui_queue.put({
+                _vpayload = {
                     "type": "latency",
                     "kind": "vision",
                     "total_ms": int((time.monotonic() - _vt0) * 1000),
                     "provider": getattr(self.vision_provider, "name", self._vision_provider),
-                })
+                }
+                await ui_queue.put(_vpayload)
+                try:
+                    log_usage(
+                        _vpayload,
+                        path=Path(config.USAGE_LOG_PATH) if config.USAGE_LOG_PATH else None,
+                        enabled=config.USAGE_LOG_ENABLED,
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
 
