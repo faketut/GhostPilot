@@ -94,12 +94,23 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
                     cs = format_cost(c)
                     if cs:
                         parts.append(cs)
+                    total_ms = msg.get("total_ms")
+                    if isinstance(total_ms, int) and total_ms > 0:
+                        parts.append(f"{total_ms}ms")
                     ui.set_usage_footer(" · ".join(parts))
                     # Session recorder (Phase 5.4)
                     from src.session_recorder import recorder as _rec
                     _rec.log_llm("assistant", "", tokens_in=msg.get("in", 0),
                                  tokens_out=msg.get("out", 0), cost_usd=c,
                                  model=msg.get("model", ""))
+                except Exception:
+                    pass
+            elif msg["type"] == "latency":
+                # Vision pipeline emits latency separately (no token-usage event).
+                try:
+                    total_ms = int(msg.get("total_ms") or 0)
+                    if total_ms > 0:
+                        ui.set_usage_footer(f"{total_ms}ms")
                 except Exception:
                     pass
         except asyncio.CancelledError:
@@ -288,8 +299,83 @@ async def run_pipelines(app, loop):
     ui_task_asr = loop.create_task(ui_updater(ui_asr, ui_queue_asr))
     ui_task_vision = loop.create_task(ui_updater(ui_vision, ui_queue_vision))
 
-    # ── KB mtime watcher: rebuild RAG when knowledge/ files change ──
-    async def _kb_watch_loop():
+    # ── KB watcher: rebuild RAG when knowledge/ files change ──
+    # Prefers QFileSystemWatcher (event-driven, ~zero latency) and falls back
+    # to mtime polling if Qt watcher is unavailable. Set KB_WATCH_INTERVAL_SEC=0
+    # to disable both.
+    _kb_watcher_refs: list = []  # keep watcher + timer alive
+
+    def _install_kb_watcher() -> bool:
+        interval_sec = max(0, int(getattr(config, "KB_WATCH_INTERVAL_SEC", 5)))
+        if interval_sec == 0:
+            return True  # disabled by user
+        try:
+            from PyQt6.QtCore import QFileSystemWatcher, QTimer
+            from src.knowledge_loader import list_knowledge_files
+        except Exception as e:
+            logger.warning(f"QFileSystemWatcher unavailable, will poll: {e}")
+            return False
+
+        kb_dir = getattr(config, "KNOWLEDGE_DIR", "knowledge")
+        params = _kb_params()
+        try:
+            files = [str(p) for p in list_knowledge_files(kb_dir, patterns=params["patterns"])]
+        except Exception as e:
+            logger.warning(f"KB watcher: listing failed ({e}); falling back to poll")
+            return False
+
+        watcher = QFileSystemWatcher()
+        # Watch the dir (catches new/deleted files) AND each file (catches edits).
+        try:
+            from pathlib import Path
+            if Path(kb_dir).is_dir():
+                watcher.addPath(str(Path(kb_dir).resolve()))
+        except Exception:
+            pass
+        if files:
+            watcher.addPaths(files)
+
+        debounce_ms = max(200, min(2000, interval_sec * 200))  # 1s default
+        debounce = QTimer()
+        debounce.setSingleShot(True)
+        debounce.setInterval(debounce_ms)
+
+        def _on_change(_path: str = ""):
+            debounce.start()
+
+        def _on_debounce_timeout():
+            try:
+                n = rag_manager.rebuild_if_stale()
+                if n is not None:
+                    logger.info("KB auto-rebuilt (event): %d chunks", n)
+                # Re-arm watcher on the new file set (catches added/renamed files)
+                try:
+                    fresh = [str(p) for p in list_knowledge_files(kb_dir, patterns=params["patterns"])]
+                    current = set(watcher.files())
+                    desired = set(fresh)
+                    if desired - current:
+                        watcher.addPaths(list(desired - current))
+                    if current - desired:
+                        watcher.removePaths(list(current - desired))
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"KB watcher rebuild failed: {e}")
+
+        debounce.timeout.connect(_on_debounce_timeout)
+        watcher.fileChanged.connect(_on_change)
+        watcher.directoryChanged.connect(_on_change)
+
+        _kb_watcher_refs.append(watcher)
+        _kb_watcher_refs.append(debounce)
+        logger.info(
+            "KB watcher armed: dir=%s, %d files, debounce=%dms",
+            kb_dir, len(files), debounce_ms,
+        )
+        return True
+
+    async def _kb_poll_loop():
+        """Fallback: mtime polling. Only used if QFileSystemWatcher install fails."""
         interval = max(0, int(getattr(config, "KB_WATCH_INTERVAL_SEC", 5)))
         if interval == 0:
             return
@@ -298,14 +384,15 @@ async def run_pipelines(app, loop):
                 await asyncio.sleep(interval)
                 n = rag_manager.rebuild_if_stale()
                 if n is not None:
-                    logger.info("KB auto-rebuilt: %d chunks (mtime changed)", n)
+                    logger.info("KB auto-rebuilt (poll): %d chunks", n)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"KB watch loop error: {e}")
+                logger.warning(f"KB poll loop error: {e}")
                 await asyncio.sleep(interval)
 
-    kb_watch_task = loop.create_task(_kb_watch_loop())
+    if not _install_kb_watcher():
+        kb_watch_task = loop.create_task(_kb_poll_loop())
 
     # ── Hotkey: Alt+P — area-select screenshot → Vision LLM ──────────────
     async def on_screenshot():
