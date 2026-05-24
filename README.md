@@ -2,6 +2,14 @@
 
 Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LLM** + **Alt+P screenshot → multimodal LLM**, with a local **hybrid RAG knowledge base**.
 
+## What's new in v0.8.0
+
+- **Observability strip on the ASR footer** — each turn shows `provider · rag:N · ↑in · ↓out · cost · latency_ms` so you can verify which LLM answered, how many RAG snippets were injected, and how long it took.
+- **Hot-reload RAG** — edit anything under `knowledge/` and the index rebuilds automatically (event-driven via `QFileSystemWatcher`, ~zero latency). Manual **Rebuild KB** button on the Prompts tab too.
+- **Settings LLM tab is grouped** — Text generation / Vision / API keys / Ollama (local) section headers; combined with provider-aware row visibility nothing irrelevant is shown.
+- **qtawesome icons** — emoji affordances replaced with Font Awesome glyphs (theme-aware, consistent across OSes). Graceful emoji fallback if qtawesome is missing.
+- **Cross-platform audio scaffold** — macOS/Linux devs can now run the full pipeline via `AUDIO_BACKEND=sounddevice` (mic input). For system-audio loopback on macOS install [BlackHole](https://existential.audio/blackhole/) and route output to it; on Linux pick a Pulseaudio monitor source.
+
 ## Features
 
 - Click-through stealth overlays (ASR + Vision) with synced hotkeys.
@@ -124,18 +132,20 @@ Both rankings are fused with Reciprocal Rank Fusion and the top matches are inje
 
 - **PyQt6 DLL load failed**: prefer installing PyQt/Qt via conda-forge (`conda install -c conda-forge pyqt=6 qt-main`) and make sure VC++ 2015-2022 x64 runtime is installed.
 - **Alt+P / Vision failures**: vision pipeline is isolated; failures should show only in the Vision overlay and not stop ASR.
+- **macOS / Linux dev mode**: `pip install -r requirements.txt` skips `pyaudiowpatch` automatically (it's `; sys_platform == "win32"`-gated) and installs `sounddevice` instead. Set `AUDIO_BACKEND=sounddevice` to use the mic, or install [BlackHole](https://existential.audio/blackhole/) (mac) / route to a Pulseaudio monitor (linux) for real system-audio loopback.
+- **KB auto-rebuild**: tweak with `KB_WATCH_INTERVAL_SEC` (default `5`; sets debounce window when QFileSystemWatcher is active; set `0` to disable both watcher and polling fallback).
 
 ## Settings UI
 
-Open from the system tray (right-click → Settings) or the ⚙️ button on the ASR overlay. Tabs:
+Open from the system tray (right-click → Settings) or the gear button on the ASR overlay. Tabs:
 
-- **🎙️ Azure** — Speech key / region / endpoint, ASR language, **ASR backend selector** (Azure ↔ Whisper)
-- **🤖 LLM** — OpenAI / DeepSeek / Gemini keys, text & vision models, **`TEXT_PROVIDER` / `VISION_PROVIDER` dropdowns**, and a 🧪 **Test selected providers** master button that runs text + vision health checks in parallel (incl. Ollama `/api/tags`)
-- **⌨️ Hotkeys** — all bindings (primary + backup)
-- **🌐 Language** — LLM response language (`auto` / `zh` / `en`)
-- **📝 Prompts** — edit system prompts (algorithm / behavioral / technical / vision); edits persist to a per-user dir (`%APPDATA%/GhostPilot/prompts` on Windows, `~/Library/Application Support/GhostPilot/prompts` on macOS, `~/.config/GhostPilot/prompts` on Linux) so they survive frozen-build upgrades
+- **Azure** — Speech key / region / endpoint, ASR language, **ASR backend selector** (Azure ↔ Whisper)
+- **LLM** — grouped into *Text generation* / *Vision* / *API keys* / *Ollama (local)* sections. Provider dropdowns + a master **Test selected providers** button (runs text + vision health checks in parallel, incl. Ollama `/api/tags`)
+- **Hotkeys** — all bindings (primary + backup)
+- **Language** — LLM response language (`auto` / `zh` / `en`)
+- **Prompts** — edit system prompts (algorithm / behavioral / technical / vision) + **Rebuild KB** button; edits persist to a per-user dir (`%APPDATA%/GhostPilot/prompts` on Windows, `~/Library/Application Support/GhostPilot/prompts` on macOS, `~/.config/GhostPilot/prompts` on Linux) so they survive frozen-build upgrades
 
-Secret fields all have a 👁 show/hide toggle. Most changes apply immediately — no restart needed.
+Secret fields all have a show/hide toggle. Most changes apply immediately — no restart needed.
 
 ## Session recording & export
 
