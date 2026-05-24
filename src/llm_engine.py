@@ -346,6 +346,14 @@ class LLMEngine:
             q_type = await self.classify_question_llm(question)
         logger.info("[%s] %s", q_type.upper(), question)
 
+        # Session recorder: pair this user turn with the assistant row that
+        # the UI updater flushes when streaming finishes (v0.9.0 replay).
+        try:
+            from src.session_recorder import recorder as _rec
+            _rec.log_user_turn(question, q_type=q_type, kind="text")
+        except Exception:
+            pass
+
         snippets, algo_blob = self._gather_context(q_type, question)
         rag_hits = len(snippets) + (1 if algo_blob else 0)
         # Observability: notify UI of provider + RAG hit count before stream starts.
@@ -633,6 +641,14 @@ class LLMEngine:
                 q_type, visible_question = await self._vision_step_a_openai(compressed)
 
             logger.info("Vision step A: type=%s visible_question_len=%d", q_type, len(visible_question))
+
+            # Session recorder: pair this vision turn with the assistant row
+            # that the UI updater flushes on 'latency' (v0.9.0 replay).
+            try:
+                from src.session_recorder import recorder as _rec
+                _rec.log_user_turn(visible_question, q_type=q_type, kind="vision")
+            except Exception:
+                pass
 
             await self._vision_step_b(compressed, q_type, visible_question, ui_queue)
 

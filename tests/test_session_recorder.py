@@ -125,3 +125,21 @@ def test_screenshot_idx_resets_per_session(isolated_recorder):
     isolated_recorder.start()
     p = isolated_recorder.log_screenshot(b"b")
     assert p is not None and p.name == "0001.jpg"
+
+
+def test_log_user_turn_pairs_with_assistant(isolated_recorder):
+    """User row → assistant row pairing is what replay walks."""
+    d = isolated_recorder.start()
+    isolated_recorder.log_user_turn("what is BFS?", q_type="technical", kind="text")
+    isolated_recorder.log_llm("assistant", "BFS is...", tokens_in=5, tokens_out=20,
+                              model="gpt-4o-mini")
+    rows = [json.loads(ln) for ln in (d / "llm.jsonl").read_text().splitlines()]
+    assert rows[0] == {**rows[0], "role": "user", "content": "what is BFS?",
+                        "q_type": "technical", "kind": "text"}
+    assert rows[1]["role"] == "assistant"
+    assert rows[1]["content"] == "BFS is..."
+
+
+def test_log_user_turn_before_start_is_noop(isolated_recorder):
+    isolated_recorder.log_user_turn("orphan", q_type="x")  # must not raise
+    assert not isolated_recorder.is_recording()

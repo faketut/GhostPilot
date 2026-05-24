@@ -140,6 +140,23 @@ class SessionRecorder:
         except Exception:
             pass
 
+    def log_user_turn(self, question: str, *, q_type: str = "", kind: str = "text") -> None:
+        """Log a ``{role:'user'}`` row immediately before the matching LLM
+        request. Used by replay to pair each user question with the
+        ``{role:'assistant'}`` row that follows it in ``llm.jsonl``.
+        """
+        if self._llm_f is None:
+            return
+        try:
+            self._llm_f.write(json.dumps(
+                {"t": time.time(), "role": "user", "content": question,
+                 "q_type": q_type, "kind": kind},
+                ensure_ascii=False,
+            ) + "\n")
+            self._llm_f.flush()
+        except Exception:
+            pass
+
     def log_screenshot(self, data: bytes, *, ext: str = "jpg") -> Path | None:
         """Persist a screenshot under the active session dir and log a pointer
         to it in ``llm.jsonl``. Returns the saved path, or None if not recording.
