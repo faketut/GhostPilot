@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest]
-        python-version: ["3.12"]
+        python-version: ["3.9", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
           # Skip PyAudioWPatch on non-Windows to keep CI green.
           grep -v '^pyaudiowpatch' requirements.txt > _req.txt
           pip install -r _req.txt
-          pip install pytest ruff
+          pip install pytest pytest-asyncio ruff
         shell: bash
 
       - name: Lint (ruff)
