@@ -142,7 +142,7 @@ _ASR_BACKEND_OPTIONS = [
 class SettingsUI(QDialog):
     def __init__(self, parent=None, *, on_saved: Optional[Callable[[dict], None]] = None,
                  on_rebuild_kb: Optional[Callable[[], int]] = None,
-                 on_replay_session: Optional[Callable[[Path], None]] = None):
+                 on_replay_session: Optional[Callable[..., None]] = None):
         super().__init__(parent)
         self.setWindowTitle("GhostPilot Copilot — Settings")
         self.setMinimumWidth(520)
@@ -605,6 +605,47 @@ class SettingsUI(QDialog):
         right.addWidget(self._sessions_split, 1)
         self._sessions_view_cmp.setVisible(False)  # hidden until a compare target is picked
 
+        # ── Prompt-override editor (closes the v0.9.0 A/B loop in-UI) ──
+        # 'Override prompt:' combo selects which q_type to override; when
+        # non-empty, an inline editor appears with the current prompt text.
+        # Edits accumulate across q_types in self._prompt_overrides so the
+        # user can stage multiple overrides for one replay.
+        self._prompt_overrides: dict[str, str] = {}
+        ov_row = QHBoxLayout()
+        ov_row.addWidget(QLabel("Override prompt:"))
+        self._override_combo = QComboBox()
+        self._override_combo.addItem("(none)", userData=None)
+        for name in prompt_loader.list_prompts():
+            self._override_combo.addItem(name, userData=name)
+        self._override_combo.currentIndexChanged.connect(self._on_override_combo_changed)
+        ov_row.addWidget(self._override_combo)
+        self._override_clear_btn = QPushButton("Clear all overrides")
+        self._override_clear_btn.setEnabled(False)
+        self._override_clear_btn.clicked.connect(self._on_clear_overrides)
+        ov_row.addWidget(self._override_clear_btn)
+        ov_row.addStretch(1)
+        right.addLayout(ov_row)
+        self._override_edit = QPlainTextEdit()
+        self._override_edit.setStyleSheet(mono)
+        self._override_edit.setMaximumHeight(110)
+        self._override_edit.setPlaceholderText("Pick a prompt above to override its text for the next replay.")
+        self._override_edit.setVisible(False)
+        self._override_edit.textChanged.connect(self._on_override_edit_changed)
+        right.addWidget(self._override_edit)
+
+        # ── Progress + cancel (only visible while a replay runs) ──
+        prog_row = QHBoxLayout()
+        self._replay_progress = QLabel("")
+        self._replay_progress.setStyleSheet("color:#9ad;")
+        prog_row.addWidget(self._replay_progress, 1)
+        self._replay_cancel_btn = QPushButton("Cancel")
+        self._replay_cancel_btn.setObjectName("cancelBtn")
+        self._replay_cancel_btn.clicked.connect(self._on_cancel_replay)
+        self._replay_cancel_btn.setVisible(False)
+        prog_row.addWidget(self._replay_cancel_btn)
+        right.addLayout(prog_row)
+        self._replay_cancel_event = None  # asyncio.Event, set by _on_replay_clicked
+
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         refresh_btn = QPushButton("Refresh")
@@ -743,14 +784,111 @@ class SettingsUI(QDialog):
         path = getattr(self, "_current_session_path", None)
         if path is None:
             return
+        # Stage the currently-edited override before kicking off.
+        self._capture_override_edit()
+        overrides = dict(self._prompt_overrides) if self._prompt_overrides else None
+
+        # Cancel event must be created on the asyncio loop; qasync shares it
+        # with Qt so the dialog thread is fine.
+        import asyncio
         try:
-            self._on_replay_session(path)
+            self._replay_cancel_event = asyncio.Event()
+        except Exception:
+            self._replay_cancel_event = None
+
+        self._replay_btn.setEnabled(False)
+        self._replay_cancel_btn.setVisible(True)
+        self._replay_cancel_btn.setEnabled(True)
+        self._replay_progress.setText("Starting replay…")
+        try:
+            self._on_replay_session(
+                path,
+                prompt_overrides=overrides,
+                on_progress=self._on_replay_progress,
+                cancel_event=self._replay_cancel_event,
+            )
+            ov_note = f" with {len(overrides)} override(s)" if overrides else ""
             self._sessions_summary.setText(
-                f"Replay scheduled for <b>{path.name}</b>. "
+                f"Replay scheduled for <b>{path.name}</b>{ov_note}. "
                 "Results will appear as a new recording — click Refresh when done."
             )
         except Exception as e:
             self._sessions_summary.setText(f"Replay failed to start: {e}")
+            self._replay_btn.setEnabled(True)
+            self._replay_cancel_btn.setVisible(False)
+
+    # Called from the asyncio loop between turns — qasync runs it on the Qt
+    # thread so widget access is safe.
+    def _on_replay_progress(self, done: int, total: int, status: str) -> None:
+        self._replay_progress.setText(status)
+        if total > 0 and done >= total:
+            self._replay_btn.setEnabled(True)
+            self._replay_cancel_btn.setVisible(False)
+            self._replay_cancel_event = None
+        elif "Cancelled" in status or "Empty" in status:
+            self._replay_btn.setEnabled(True)
+            self._replay_cancel_btn.setVisible(False)
+            self._replay_cancel_event = None
+
+    def _on_cancel_replay(self) -> None:
+        ev = self._replay_cancel_event
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+            self._replay_cancel_btn.setEnabled(False)
+            self._replay_progress.setText("Cancelling after current turn…")
+
+    # ── Prompt-override editor handlers ──────────────────────────────
+    def _capture_override_edit(self) -> None:
+        """Persist the currently-shown editor text into self._prompt_overrides."""
+        name = self._override_combo.currentData()
+        if not name:
+            return
+        text = self._override_edit.toPlainText()
+        # Treat 'identical to current prompt' as no override so the dict stays
+        # honest about what's actually being overridden.
+        if text.strip() and text != prompt_loader.get_prompt(name):
+            self._prompt_overrides[name] = text
+        else:
+            self._prompt_overrides.pop(name, None)
+        self._override_clear_btn.setEnabled(bool(self._prompt_overrides))
+
+    def _on_override_combo_changed(self, _idx: int) -> None:
+        # Save the previous q_type's edit before switching.
+        prev = getattr(self, "_override_prev_name", None)
+        if prev:
+            cur_text = self._override_edit.toPlainText()
+            if cur_text.strip() and cur_text != prompt_loader.get_prompt(prev):
+                self._prompt_overrides[prev] = cur_text
+            else:
+                self._prompt_overrides.pop(prev, None)
+
+        name = self._override_combo.currentData()
+        self._override_prev_name = name
+        if not name:
+            self._override_edit.setVisible(False)
+            self._override_edit.setPlainText("")
+        else:
+            staged = self._prompt_overrides.get(name)
+            self._override_edit.setPlainText(
+                staged if staged is not None else prompt_loader.get_prompt(name)
+            )
+            self._override_edit.setVisible(True)
+        self._override_clear_btn.setEnabled(bool(self._prompt_overrides))
+
+    def _on_override_edit_changed(self) -> None:
+        # Live-stage so reopening the combo to another name doesn't lose work.
+        self._capture_override_edit()
+
+    def _on_clear_overrides(self) -> None:
+        self._prompt_overrides.clear()
+        self._override_clear_btn.setEnabled(False)
+        # Reset the editor to the current prompt text for the selected name.
+        name = self._override_combo.currentData()
+        if name:
+            self._override_edit.setPlainText(prompt_loader.get_prompt(name))
 
     def _current_prompt_name(self) -> str | None:
         it = self._prompt_list.currentItem()

@@ -289,12 +289,24 @@ async def run_pipelines(app, loop):
             logger.error(f"Runtime settings apply failed: {e}")
 
     # Create overlays after we have the callback
-    def _start_replay(path):
+    def _start_replay(path, *, prompt_overrides=None, on_progress=None,
+                      cancel_event=None):
         """Kick off a non-blocking replay of `path` through the live engine.
 
         Re-runs every recorded turn while a fresh SessionRecorder captures the
         results, so the user can compare old vs new by opening the new
         recording in the Sessions tab.
+
+        Args:
+            prompt_overrides: ``{q_type: text}`` forwarded to each
+                ``replay_turn`` call so the user can A/B test alternate prompts
+                without writing them to disk.
+            on_progress: optional ``callable(done, total, status_text)`` invoked
+                from the asyncio loop between turns. Qasync shares the Qt event
+                loop so the callback may safely touch widgets.
+            cancel_event: optional ``asyncio.Event``; checked between turns so
+                a long replay can be stopped mid-way (the in-flight turn still
+                runs to completion).
         """
         from src import session_replay
         from src.session_recorder import recorder as _rec
@@ -302,15 +314,33 @@ async def run_pipelines(app, loop):
         async def _run():
             sdir = session_replay.open_session(path)
             turns = list(session_replay.iter_turns(sdir))
-            if not turns:
+            total = len(turns)
+            if total == 0:
+                if on_progress:
+                    try: on_progress(0, 0, "Empty recording — nothing to replay.")
+                    except Exception: pass
                 return
             _rec.start()
             try:
-                for turn in turns:
+                for i, turn in enumerate(turns, 1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        if on_progress:
+                            try: on_progress(i - 1, total, "Cancelled.")
+                            except Exception: pass
+                        break
+                    if on_progress:
+                        try: on_progress(i - 1, total, f"Replaying turn {i}/{total}…")
+                        except Exception: pass
                     try:
-                        await session_replay.replay_turn(llm_engine, turn)
+                        await session_replay.replay_turn(
+                            llm_engine, turn, prompt_overrides=prompt_overrides,
+                        )
                     except Exception as e:
                         logger.warning("Replay turn failed: %s", e)
+                else:
+                    if on_progress:
+                        try: on_progress(total, total, f"Done — {total}/{total} turns replayed.")
+                        except Exception: pass
             finally:
                 out = _rec.stop()
                 logger.info("Replay finished → %s", out)
