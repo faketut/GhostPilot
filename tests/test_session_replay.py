@@ -42,6 +42,21 @@ def test_iter_turns_attaches_screenshot(tmp_path):
     assert t.screenshot_bytes == b"\xff\xd8\xff"
 
 
+def test_iter_turns_attaches_screenshot_written_before_user_row(tmp_path):
+    """The live recorder logs the screenshot first; it must still reach the turn."""
+    shot_dir = tmp_path / "screenshots"
+    shot_dir.mkdir()
+    (shot_dir / "0001.jpg").write_bytes(b"\xff\xd8\xff")
+    _write_jsonl(tmp_path / "llm.jsonl", [
+        {"role": "screenshot", "path": "screenshots/0001.jpg"},
+        {"role": "user", "content": "what's on screen?", "q_type": "technical", "kind": "vision"},
+        {"role": "assistant", "content": "I see a code editor."},
+    ])
+    turns = list(sr.iter_turns(tmp_path))
+    assert len(turns) == 1
+    assert turns[0].screenshot_bytes == b"\xff\xd8\xff"
+
+
 def test_iter_turns_drops_orphan_user_when_next_user_appears(tmp_path):
     """Defensive: if a user row never got an assistant, the next user row replaces it."""
     _write_jsonl(tmp_path / "llm.jsonl", [

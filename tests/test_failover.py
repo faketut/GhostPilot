@@ -32,10 +32,6 @@ class _FakeProvider:
                 raise self._raises  # type: ignore[misc]
             yield d
 
-    async def vision_stream(self, *_a, **_k):
-        async for d in self.chat_stream():
-            yield d
-
 
 @pytest.mark.asyncio
 async def test_failover_uses_primary_when_healthy():

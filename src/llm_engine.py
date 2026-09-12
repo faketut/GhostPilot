@@ -4,29 +4,46 @@ LLM Engine
 Routes classified questions to the appropriate LLM with prompts loaded from
 the `prompts/` directory via PromptLoader.
 
-Text route  → DeepSeek-V3 (or any OpenAI-compatible model)
-Vision route → GPT-4o (or any vision-capable model)
+Text route   → the configured text model (DeepSeek-V4 by default)
+Vision route → local OCR (Ollama + GLM-OCR) → same text route as above
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import io
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from openai import AsyncOpenAI
 from PIL import Image
 
 from src.config import config
+from src.ocr_client import OCRError, OCRTruncated, OCRClient
+from src import ollama_boot
+from src.knowledge_loader import load_knowledge_file
 from src.rag_manager import RAGManager
 from src.prompt_loader import get_prompt
-from src.llm import make_text_provider, make_vision_provider, Usage
+from src.llm import make_text_provider, Usage
 from src.usage_log import log_usage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TurnContext:
+    """Reference material injected ahead of one question.
+
+    Two kinds, deliberately not interchangeable: ``snippets`` are *retrieved*
+    from the knowledge base and ``algorithm_ref`` is the patterns cheatsheet
+    injected *whole* for algorithm turns. Only ``snippets`` may be reported as
+    RAG hits — a fixed injection is not a retrieval, and counting it as one
+    would make the observability footer describe something that did not happen.
+    """
+    snippets: list[str] = field(default_factory=list)
+    algorithm_ref: str | None = None
+
 
 # ── Question classifier (keyword fallback) ────────────────────────────────
 
@@ -99,11 +116,30 @@ Definitions:
 - algorithm: coding / DSA / LeetCode style, implementations, complexity, specific algorithm names."""
 
 
-_VISION_STEP_A_SYSTEM = """You analyze one screenshot from a technical interview.
-Reply with JSON only, no markdown. Schema:
-{"visible_question":"<plain text of the main question on screen, or empty string>","type":"behavioral|technical|algorithm"}
+def _answer_token_cap() -> int | None:
+    """Configured output cap for an answer call, or None for "uncapped".
 
-Use the same definitions as a text classifier: behavioral = soft skills, STAR stories, motivation/why-us/fit/self-intro; technical = concepts/design/tools; algorithm = coding/DSA."""
+    ``ANSWER_MAX_TOKENS=0`` (the default) leaves the call uncapped: for a
+    reasoning model a cap is shared with the hidden chain-of-thought, so a fixed
+    number can be spent entirely on reasoning and leave the visible answer
+    empty. Only a positive value imposes one.
+    """
+    try:
+        cap = int(getattr(config, "ANSWER_MAX_TOKENS", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
+def _is_truncated(finish_reason: str | None) -> bool:
+    """True when the provider stopped because it ran out of output budget.
+
+    OpenAI-compatible servers report ``"length"``; google-genai reports
+    ``MAX_TOKENS`` (normalised to the bare name when the delta was built).
+    """
+    if not finish_reason:
+        return False
+    return finish_reason.strip().lower() in {"length", "max_tokens"}
 
 
 def _lang_suffix() -> str:
@@ -134,18 +170,12 @@ class LLMEngine:
         from collections import deque
         n = int(getattr(config, "CONTEXT_TURNS", 0) or 0)
         self._text_history: deque = deque(maxlen=max(n, 0))
-        # Vision history (Phase 3.2): last N (timestamp, compressed_jpeg, question, answer).
-        vn = int(getattr(config, "VISION_HISTORY", 5) or 0)
-        self._vision_history: deque = deque(maxlen=max(vn, 0))
+        # One warning (not one per turn) when the algorithm cheatsheet is absent.
+        self._algo_ref_warned = False
 
     def clear_history(self) -> None:
         """Drop multi-turn conversation history (called from UI Clear button)."""
         self._text_history.clear()
-        self._vision_history.clear()
-
-    def recent_vision(self) -> list[tuple]:
-        """Return a snapshot of recent vision turns: [(ts, image_bytes, q, a), ...]."""
-        return list(self._vision_history)
 
     async def preheat(self) -> None:
         """Fire-and-forget tiny request to warm the HTTPS pool. Throttled to once
@@ -168,9 +198,17 @@ class LLMEngine:
             logger.info("Preheat skipped: %s", e)
 
     def register_task(self, kind: str, task: asyncio.Task) -> None:
-        """Register a running stream task under 'text' | 'vision' so it can be cancelled."""
+        """Register a running stream task under 'text' | 'vision' so it can be cancelled.
+
+        A *new* stream supersedes the previous one for that kind. It must not
+        cancel `task` when the caller re-registers itself: `asr_router` is one
+        long-lived task that awaits an answer per question, so cancelling the
+        previous registration would cancel the router — killing every second
+        question (the CancelledError is swallowed by the router's own handler, so
+        the only symptom is an answer that never arrives).
+        """
         prev = self._active_tasks.get(kind)
-        if prev is not None and not prev.done():
+        if prev is not None and prev is not task and not prev.done():
             prev.cancel()
         self._active_tasks[kind] = task
         task.add_done_callback(lambda t, k=kind: self._active_tasks.pop(k, None) if self._active_tasks.get(k) is t else None)
@@ -187,29 +225,20 @@ class LLMEngine:
         return n
 
     def _init_clients(self):
-        # New provider abstraction (Phase 2.1).
+        # Provider abstraction (text only — OCR is local, see src/ocr_client.py).
         self.text_provider = make_text_provider()
-        self.vision_provider = make_vision_provider()
         # Last observed usage per pipeline (consumed by Phase 2.3 token counter).
         self.last_usage: dict[str, Usage] = {}
+        self.ocr = self._make_ocr_client()
 
-        # ── Legacy raw-SDK client kept only for vision step A (OpenAI family) ──
-        # The streaming text path and vision step B both go through the provider
-        # abstraction now; only `_vision_step_a_openai` still calls the OpenAI
-        # SDK directly because it needs a one-shot JSON response. Routing it
-        # through the provider abstraction is tracked as future work.
-        def _is_deepseek(m: str) -> bool:
-            return "deepseek" in (m or "").lower()
-
-        vm = (config.VISION_MODEL or "").lower()
-        self.vision_client = None
-        if vm.startswith("gemini"):
-            self._vision_provider = "gemini"
-        elif _is_deepseek(config.VISION_MODEL):
-            self._vision_provider = "deepseek"
-        else:
-            self._vision_provider = "openai_compatible"
-            self.vision_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+    @staticmethod
+    def _make_ocr_client() -> OCRClient:
+        return OCRClient(
+            base_url=getattr(config, "OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+            model=getattr(config, "OCR_MODEL", "glm-ocr-optimized"),
+            prompt=getattr(config, "OCR_PROMPT", "Transcribe all text in this image. Output only the text."),
+            timeout=float(getattr(config, "OCR_TIMEOUT_SEC", 180.0) or 180.0),
+        )
 
     def reload_clients(self):
         """
@@ -252,10 +281,15 @@ class LLMEngine:
             logger.warning(f"LLM classifier failed, using keywords: {e}")
         return classify_question(q)
 
-    def _gather_context(self, q_type: str, question: str) -> tuple[list[str], str | None]:
-        """
-        Returns (rag_snippets, algorithm_markdown_or_none).
-        Algorithm mode skips vector RAG and loads knowledge/algorithm.md.
+    def _gather_context(self, q_type: str, question: str) -> TurnContext:
+        """Everything injected ahead of the question on this turn.
+
+        Behavioral and technical turns retrieve: ``knowledge/`` holds candidate
+        background (resume, JD, notes) and ``RAG_MIN_SCORE`` gates what is
+        relevant. Algorithm turns instead take the patterns cheatsheet whole —
+        see ``ALGORITHM_KNOWLEDGE_FILE``. The two are kept in named fields
+        because they are not the same thing: ``rag_hits`` reports retrieval, and
+        a fixed injection counted into it would make the footer lie.
         """
         min_score = self._rag_min_score()
         q = question or ""
@@ -265,62 +299,71 @@ class LLMEngine:
             def _beh_filter(rel: str) -> bool:
                 return _basename_kb(rel) in ("resume.md", "jd.md")
 
-            snippets = self.rag.search(
+            return TurnContext(snippets=self.rag.search(
                 q, top_k=3, min_score=min_score, source_filter=_beh_filter
-            )
-            return snippets, None
+            ))
 
         if q_type == "technical":
 
             def _tech_filter(rel: str) -> bool:
                 return _basename_kb(rel) != "jd.md"
 
-            snippets = self.rag.search(
+            return TurnContext(snippets=self.rag.search(
                 q, top_k=3, min_score=min_score, source_filter=_tech_filter
-            )
-            return snippets, None
+            ))
 
         if q_type == "algorithm":
-            path = Path(getattr(config, "KNOWLEDGE_DIR", "knowledge")) / "algorithm.md"
-            blob: str | None = None
-            if path.exists():
-                try:
-                    blob = path.read_text(encoding="utf-8", errors="ignore").strip()
-                except OSError as e:
-                    logger.warning("Could not read algorithm.md: %s", e)
-            else:
-                logger.warning("algorithm.md not found at %s", path.resolve())
-            if not blob:
-                blob = None
-            return [], blob
+            return TurnContext(algorithm_ref=self._algorithm_reference())
 
-        return [], None
+        return TurnContext()
+
+    def _algorithm_reference(self) -> str | None:
+        """The patterns cheatsheet injected into algorithm turns, or None.
+
+        A missing file is logged once per process, not once per turn: this used
+        to warn on every algorithm question, which buries the signal it is
+        trying to send.
+        """
+        name = getattr(config, "ALGORITHM_KNOWLEDGE_FILE", "algorithm.md")
+        text, path = load_knowledge_file(
+            getattr(config, "KNOWLEDGE_DIR", "knowledge"),
+            name,
+            max_chars=int(getattr(config, "ALGORITHM_KNOWLEDGE_MAX_CHARS", 8000) or 0),
+        )
+        if text:
+            return text
+        if not getattr(self, "_algo_ref_warned", False):
+            self._algo_ref_warned = True
+            logger.warning(
+                "No algorithm cheatsheet found for ALGORITHM_KNOWLEDGE_FILE=%r under %s; "
+                "algorithm turns go out without pattern reference material.",
+                name, getattr(config, "KNOWLEDGE_DIR", "knowledge"),
+            )
+        return None
 
     def _build_interview_messages(
         self,
         q_type: str,
         question: str,
-        context_snippets: list[str],
-        algorithm_blob: str | None,
+        context: TurnContext,
         *,
-        vision_mode: bool,
-        visible_question: str = "",
+        from_screenshot: bool = False,
     ) -> list[dict]:
         system_prompt = get_prompt(q_type) + _lang_suffix()
 
         parts: list[str] = []
-        if context_snippets:
-            joined = "\n---\n".join(context_snippets[:3])
+        if context.snippets:
+            joined = "\n---\n".join(context.snippets[:3])
             parts.append(f"[Candidate background]\n{joined}")
-        if algorithm_blob:
-            parts.append(f"[Reference: knowledge/algorithm.md]\n{algorithm_blob}")
+        if context.algorithm_ref:
+            parts.append(f"[Algorithm patterns reference]\n{context.algorithm_ref}")
 
-        if vision_mode:
-            vq = (visible_question or "").strip()
+        if from_screenshot:
             parts.append(
-                "A screenshot of the interview is attached. "
-                "Base your answer on both the image and any context above.\n"
-                f"Transcribed visible question (may be empty): {vq!r}"
+                "The question below was transcribed by a local OCR model from a "
+                "screenshot of the interviewer's screen. Ignore obvious OCR noise, "
+                "UI chrome and toolbar text; answer the question itself.\n"
+                f"Transcribed question:\n{question}"
             )
         else:
             parts.append(f"Interviewer question:\n{question}")
@@ -338,39 +381,54 @@ class LLMEngine:
         *,
         q_type: str | None = None,
     ):
-        """Classify (optional) → RAG / algorithm.md → LLM → stream tokens."""
+        """Classify (optional) → RAG / algorithm prompt → LLM → stream tokens."""
         cur = asyncio.current_task()
         if cur is not None:
             self.register_task("text", cur)
         if q_type is None:
             q_type = await self.classify_question_llm(question)
+        await self._answer_stream(question, ui_queue, q_type=q_type, kind="text")
+
+    async def _answer_stream(
+        self,
+        question: str,
+        ui_queue: asyncio.Queue,
+        *,
+        q_type: str,
+        kind: str,
+        from_screenshot: bool = False,
+    ):
+        """RAG / algorithm prompt → text LLM → stream tokens, usage and telemetry."""
         logger.info("[%s] %s", q_type.upper(), question)
 
         # Session recorder: pair this user turn with the assistant row that
         # the UI updater flushes when streaming finishes (v0.9.0 replay).
         try:
             from src.session_recorder import recorder as _rec
-            _rec.log_user_turn(question, q_type=q_type, kind="text")
+            _rec.log_user_turn(question, q_type=q_type, kind=kind)
         except Exception:
             pass
 
-        snippets, algo_blob = self._gather_context(q_type, question)
-        rag_hits = len(snippets) + (1 if algo_blob else 0)
-        # Observability: notify UI of provider + RAG hit count before stream starts.
+        context = self._gather_context(q_type, question)
+        rag_hits = len(context.snippets)
+        algo_chars = len(context.algorithm_ref or "")
+        # Observability: notify UI of provider + injected-context counts before
+        # the stream starts. `rag_hits` is retrieval only; the algorithm
+        # cheatsheet is reported separately so neither number lies.
         try:
             await ui_queue.put({
                 "type": "info",
                 "provider": getattr(self.text_provider, "name", "?"),
                 "rag_hits": rag_hits,
+                "algo_chars": algo_chars,
             })
         except Exception:
             pass
         messages = self._build_interview_messages(
             q_type,
             question,
-            snippets,
-            algo_blob,
-            vision_mode=False,
+            context,
+            from_screenshot=from_screenshot,
         )
         # Insert prior turns between system and the new user message.
         if self._text_history.maxlen and len(self._text_history) > 0:
@@ -402,21 +460,26 @@ class LLMEngine:
             agen = self.text_provider.chat_stream(
                 messages,
                 model=config.TEXT_MODEL,
-                max_tokens=450,
+                max_tokens=_answer_token_cap(),
                 temperature=0.25,
             )
+            _finish_reason: str | None = None
             async for delta in agen:
+                fr = getattr(delta, "finish_reason", None)
+                if fr:
+                    _finish_reason = fr
                 if delta.text:
                     if _ttft_ms is None:
                         _ttft_ms = int((time.monotonic() - _t0) * 1000)
                     full_answer_parts.append(delta.text)
                     await ui_queue.put({"type": "token", "text": delta.text})
                 if delta.usage:
-                    self.last_usage["text"] = delta.usage
+                    self.last_usage[kind] = delta.usage
                     _used = getattr(self.text_provider, "last_used", self.text_provider)
-                    _payload = {"type": "usage", "kind": "text",
+                    _payload = {"type": "usage", "kind": kind,
                                 "in": delta.usage.in_tokens,
                                 "out": delta.usage.out_tokens,
+                                "reasoning": delta.usage.reasoning_tokens,
                                 "model": config.TEXT_MODEL,
                                 "total_ms": int((time.monotonic() - _t0) * 1000),
                                 "ttft_ms": _ttft_ms,
@@ -430,6 +493,34 @@ class LLMEngine:
                         )
                     except Exception:
                         pass
+            # A provider that stopped because it ran out of output budget does not
+            # signal it any other way than `finish_reason`. Without this the user
+            # sees a code block that simply ends mid-line and assumes the model
+            # gave up — or, worse, mistakes it for the whole answer. With
+            # reasoning models this is the common case rather than a rare one:
+            # the budget covers the hidden chain-of-thought *and* the answer, so
+            # the trace can consume it before any answer is written.
+            if _is_truncated(_finish_reason):
+                cap = _answer_token_cap()
+                reasoning = int(getattr(self.last_usage.get(kind), "reasoning_tokens", 0) or 0)
+                logger.warning(
+                    "Answer truncated (%s stop) with cap=%s; %s of the output tokens "
+                    "were reasoning.", _finish_reason, cap, reasoning,
+                )
+                via = (
+                    f" ({reasoning} of them spent on hidden reasoning before the answer)"
+                    if reasoning else ""
+                )
+                if cap is None:
+                    # Uncapped: the provider's own limit stopped it, so raising
+                    # our setting is not the remedy.
+                    detail = "the model's own output limit"
+                else:
+                    detail = f"the {cap}-token ANSWER_MAX_TOKENS cap"
+                await ui_queue.put({
+                    "type": "token",
+                    "text": (f"\n\n[⚠️ truncated — stopped at {detail}{via}]"),
+                })
 
         except asyncio.CancelledError:
             logger.info("Text stream cancelled.")
@@ -446,241 +537,147 @@ class LLMEngine:
                     self._text_history.append((question, answer))
 
     @staticmethod
-    def _compress_jpeg(image_bytes: bytes) -> bytes:
+    def _prepare_ocr_image(image_bytes: bytes) -> bytes:
+        """Fit a screenshot for OCR and re-encode as JPEG.
+
+        GLM-OCR's accuracy and speed are driven by pixel dimensions. Scaling is
+        bounded in *both* directions:
+
+        * **down** to ``OCR_MAX_DIMENSION`` — the vision prefill is the dominant
+          cost of a full-screen shot (~9 s at 1024 px long edge, ~25 s at
+          900 px on a cropped region).
+        * **up** to ``OCR_MIN_DIMENSION`` — a small drag-selected region sent at
+          its native size (e.g. 500x260) is unreadable for the model, which then
+          latches onto a token group and repeats it; upscaling makes the text
+          legible again and the run terminates on its own.
+        """
         img = Image.open(io.BytesIO(image_bytes))
-        max_w = 1920
-        if img.width > max_w:
-            ratio = max_w / img.width
-            img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+        max_dim = max(256, int(getattr(config, "OCR_MAX_DIMENSION", 1024) or 1024))
+        min_dim = max(0, int(getattr(config, "OCR_MIN_DIMENSION", 0) or 0))
+        longest = max(img.size)
+        if longest > max_dim:
+            ratio = max_dim / longest
+        elif min_dim and longest < min_dim:
+            ratio = min_dim / longest
+        else:
+            ratio = 1.0
+        if ratio != 1.0:
+            img = img.resize(
+                (max(1, round(img.width * ratio)), max(1, round(img.height * ratio))),
+                Image.LANCZOS,
+            )
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
         return buf.getvalue()
 
-    async def _vision_step_a_openai(self, compressed: bytes) -> tuple[str, str]:
-        b64 = base64.b64encode(compressed).decode("utf-8")
-        messages = [
-            {"role": "system", "content": _VISION_STEP_A_SYSTEM + _lang_suffix()},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Analyze this screenshot and output the JSON described in your instructions.",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
-        ]
-        resp = await self.vision_client.chat.completions.create(
-            model=config.VISION_MODEL,
-            messages=messages,
-            max_tokens=256,
-            temperature=0.1,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        try:
-            data = _parse_json_object(text)
-            vq = str(data.get("visible_question", "") or "")
-            t = _normalize_q_type(data.get("type")) or classify_question(vq or "interview")
-            return t, vq
-        except Exception as e:
-            logger.warning("Vision step A (OpenAI) JSON parse failed: %s", e)
-            return "technical", ""
+    async def _ocr_screenshot(self, prepared: bytes, ui_queue: asyncio.Queue) -> str:
+        """Stream a screenshot through local OCR; return the full recognized text.
 
-    async def _vision_step_a_gemini(self, compressed: bytes) -> tuple[str, str]:
-        from google import genai
-        from google.genai import types
+        Progress is surfaced as ``status`` events (model name + recognized tail)
+        so the overlay shows something during the CPU-bound recognition pass.
 
-        if not config.GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is empty. Please set it in .env / Settings.")
-
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
-        gemini_config = types.GenerateContentConfig(
-            system_instruction=_VISION_STEP_A_SYSTEM + _lang_suffix(),
-            max_output_tokens=256,
-            temperature=0.1,
-        )
-        resp = await client.aio.models.generate_content(
-            model=config.VISION_MODEL,
-            contents=[
-                "Analyze this screenshot and output the JSON described in your instructions.",
-                types.Part.from_bytes(data=compressed, mime_type="image/jpeg"),
-            ],
-            config=gemini_config,
-        )
-        text = (resp.text or "").strip()
-        try:
-            data = _parse_json_object(text)
-            vq = str(data.get("visible_question", "") or "")
-            t = _normalize_q_type(data.get("type")) or classify_question(vq or "interview")
-            return t, vq
-        except Exception as e:
-            logger.warning("Vision step A (Gemini) JSON parse failed: %s", e)
-            return "technical", ""
-
-    def _build_vision_payload(self, system_prompt: str, user_text: str, compressed: bytes):
-        """Return a payload shaped for the active vision provider family.
-
-        Vision providers don't share a payload format (gemini takes a list of
-        parts; openai-compat takes a chat-style messages list). So we build
-        the right shape here based on provider name. Failover between
-        different families will fail at request time; see README.
+        A truncated recognition (token cap, deadline, or a degenerate repetition
+        loop) still yields usable text, so the partial transcript is returned
+        rather than discarded; the shortfall is noted in the status line.
         """
-        name = (getattr(self.vision_provider, "name", "") or self._vision_provider or "").lower()
-        if "gemini" in name:
-            from google.genai import types
-            return [
-                user_text,
-                types.Part.from_bytes(data=compressed, mime_type="image/jpeg"),
-            ]
-        # OpenAI-compatible (incl. fallbacks)
-        b64 = base64.b64encode(compressed).decode("utf-8")
-        return [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
-        ]
+        # Single choke point for talking to Ollama, so the "is it up?" wait lives
+        # here. A screenshot taken seconds after launch can arrive while a local
+        # Ollama is still starting; waiting (a cached no-op once the server
+        # answers) turns that into a slightly slower answer instead of a
+        # ConnectError in the overlay.
+        if not await ollama_boot.ensure_available_for_config():
+            logger.warning("Proceeding without a reachable Ollama; OCR will likely fail.")
 
-    async def _vision_step_b(
-        self, compressed: bytes, q_type: str, visible_question: str, ui_queue: asyncio.Queue,
-    ):
-        """Unified vision step B that routes through self.vision_provider."""
-        rag_q = visible_question.strip() or "interview screenshot"
-        snippets, algo_blob = self._gather_context(q_type, rag_q)
-        base = self._build_interview_messages(
-            q_type,
-            rag_q,
-            snippets,
-            algo_blob,
-            vision_mode=True,
-            visible_question=visible_question,
-        )
-        system_prompt = base[0]["content"]
-        user_text = base[1]["content"]
-        payload = self._build_vision_payload(system_prompt, user_text, compressed)
-
-        # Wire failover hook so vision switches are visible in the footer.
-        def _on_failover(prev, nxt, err):
+        parts: list[str] = []
+        note = ""
+        try:
+            async for chunk in self.ocr.recognize_stream(prepared):
+                parts.append(chunk)
+                tail = "".join(parts)[-120:].replace("\n", " ").strip()
+                try:
+                    await ui_queue.put({"type": "status", "text": f"OCR · {tail}"})
+                except Exception:
+                    pass
+        except OCRTruncated as e:
+            logger.warning("OCR truncated: %s", e)
+            note = str(e)
+        text = "".join(parts).strip()
+        if note:
             try:
-                ui_queue.put_nowait({
-                    "type": "info",
-                    "kind": "vision",
-                    "provider": getattr(nxt, "name", "?"),
-                    "note": f"failover from {getattr(prev, 'name', '?')}",
-                    "error": str(err)[:120],
-                })
+                await ui_queue.put({"type": "status", "text": f"OCR · {note}"})
             except Exception:
                 pass
-        if hasattr(self.vision_provider, "on_failover"):
-            self.vision_provider.on_failover = _on_failover
-
-        agen = self.vision_provider.vision_stream(
-            payload,
-            model=config.VISION_MODEL,
-            system_prompt=system_prompt,
-            max_tokens=550,
-            temperature=0.25,
-        )
-        async for delta in agen:
-            if delta.text:
-                await ui_queue.put({"type": "token", "text": delta.text})
+        return text
 
     async def generate_vision_answer_stream(
         self, image_bytes: bytes, ui_queue: asyncio.Queue
-    ):
-        """
-        Compress screenshot → classify + extract question (vision) →
-        RAG / algorithm.md → final vision stream.
+    ) -> str:
+        """Screenshot → local OCR → text LLM answer.
+
+        Returns the recognized text (the question that was answered) so callers
+        can log or display it. Emits the same ``token``/``usage``/``info`` events
+        as the text pipeline, plus:
+          * ``status``       — OCR progress (model + recognized tail)
+          * ``answer_start`` — recognized question is final; begin the answer turn
         """
         cur = asyncio.current_task()
         if cur is not None:
             self.register_task("vision", cur)
-        logger.info("Vision answer requested (two-step).")
-        import time
-        _vt0 = time.monotonic()
+        logger.info("Screenshot OCR requested (local model=%s).", self.ocr.model)
+
         try:
-            compressed = self._compress_jpeg(image_bytes)
+            prepared = await asyncio.to_thread(self._prepare_ocr_image, image_bytes)
             logger.info(
-                "Screenshot compressed: %dKB → %dKB",
+                "Screenshot prepared for OCR: %dKB → %dKB (max edge %dpx)",
                 len(image_bytes) // 1024,
-                len(compressed) // 1024,
+                len(prepared) // 1024,
+                int(getattr(config, "OCR_MAX_DIMENSION", 1024) or 1024),
             )
+            try:
+                await ui_queue.put({"type": "status", "text": f"OCR · {self.ocr.model}"})
+            except Exception:
+                pass
 
-            if self._vision_provider == "deepseek":
-                raise ValueError(
-                    "DeepSeek /chat/completions does not support OpenAI-style image inputs "
-                    "(message content blocks with type=image_url). "
-                    "Use Gemini (VISION_MODEL=gemini-1.5-flash) or OpenAI vision (gpt-4o), "
-                    "or configure a vision provider that supports multimodal chat."
+            recognized = await self._ocr_screenshot(prepared, ui_queue)
+            if not recognized:
+                raise OCRError(
+                    "GLM-OCR recognized no text in this screenshot — try a tighter crop."
                 )
+            logger.info("OCR recognized %d chars.", len(recognized))
 
-            if self._vision_provider == "gemini":
-                try:
-                    from google import genai  # noqa: F401
-                except Exception as e:
-                    raise RuntimeError(f"Failed to import google-genai SDK: {e}") from e
-                q_type, visible_question = await self._vision_step_a_gemini(compressed)
-            else:
-                q_type, visible_question = await self._vision_step_a_openai(compressed)
-
-            logger.info("Vision step A: type=%s visible_question_len=%d", q_type, len(visible_question))
-
-            # Session recorder: pair this vision turn with the assistant row
-            # that the UI updater flushes on 'latency' (v0.9.0 replay).
+            # Persist the screenshot *before* the user turn: replay pairs a
+            # `user` row with the `screenshot` row that follows it.
             try:
                 from src.session_recorder import recorder as _rec
-                _rec.log_user_turn(visible_question, q_type=q_type, kind="vision")
+                _rec.log_screenshot(prepared)
             except Exception:
                 pass
 
-            await self._vision_step_b(compressed, q_type, visible_question, ui_queue)
-
-            # Record entry on successful completion (Phase 3.2).
-            if self._vision_history.maxlen:
-                import time
-                self._vision_history.append((time.time(), compressed, visible_question, ""))
-
-            # Latency telemetry for the vision pipeline.
+            q_type = await self.classify_question_llm(recognized)
             try:
-                _vpayload = {
-                    "type": "latency",
-                    "kind": "vision",
-                    "total_ms": int((time.monotonic() - _vt0) * 1000),
-                    "provider": getattr(self.vision_provider, "name", self._vision_provider),
-                }
-                await ui_queue.put(_vpayload)
-                try:
-                    log_usage(
-                        _vpayload,
-                        path=Path(config.USAGE_LOG_PATH) if config.USAGE_LOG_PATH else None,
-                        enabled=config.USAGE_LOG_ENABLED,
-                    )
-                except Exception:
-                    pass
+                await ui_queue.put({
+                    "type": "answer_start",
+                    "question": recognized,
+                    "q_type": q_type,
+                })
             except Exception:
                 pass
+
+            await self._answer_stream(
+                recognized, ui_queue, q_type=q_type, kind="vision",
+                from_screenshot=True,
+            )
+            return recognized
 
         except asyncio.CancelledError:
-            logger.info("Vision stream cancelled.")
+            logger.info("Screenshot pipeline cancelled.")
             await ui_queue.put({"type": "token", "text": "\n[⏹ stopped]"})
             raise
+        except OCRError as e:
+            logger.error("Screenshot OCR failed: %s", e)
+            await ui_queue.put({"type": "token", "text": f"\n[⚠️ OCR Error: {e}]"})
+            return ""
         except Exception as e:
-            logger.error("Vision LLM error: %s", e)
-            await ui_queue.put({"type": "token", "text": f"\n[⚠️ Vision Error: {e}]"})
+            logger.error("Screenshot pipeline error: %s", e)
+            await ui_queue.put({"type": "token", "text": f"\n[⚠️ OCR Error: {e}]"})
+            return ""

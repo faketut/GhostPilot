@@ -105,7 +105,7 @@ class FailoverProvider(LLMProvider):
         delay = self.backoff_base * (2 ** attempt)
         await asyncio.sleep(delay)
 
-    async def chat_complete(self, messages, *, model, max_tokens=256, temperature=0.1) -> str:
+    async def chat_complete(self, messages, *, model, max_tokens: int | None = 256, temperature=0.1) -> str:
         last_err: Exception | None = None
         prev: LLMProvider | None = None
         for prov in self._chain():
@@ -192,19 +192,9 @@ class FailoverProvider(LLMProvider):
         assert last_err is not None
         raise last_err
 
-    def chat_stream(self, messages, *, model, max_tokens=512, temperature=0.25):
+    def chat_stream(self, messages, *, model, max_tokens: int | None = None, temperature=0.25):
         return self._stream_with_failover(
             "chat_stream", messages, model=model, max_tokens=max_tokens, temperature=temperature,
-        )
-
-    def vision_stream(self, messages_or_parts, *, model, system_prompt, max_tokens=550, temperature=0.25):
-        return self._stream_with_failover(
-            "vision_stream",
-            messages_or_parts,
-            model=model,
-            system_prompt=system_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
         )
 
 

@@ -35,6 +35,35 @@ except ImportError:
 _MIN_SELECTION_PX = 10
 
 
+def _physical_box(rect, monitor: dict, scale: float = 1.0) -> dict:
+    """Map a Qt *logical*-pixel selection to an ``mss`` *physical*-pixel box.
+
+    Qt reports screen geometry in device-independent pixels — on a 200% display
+    the primary screen is 1500x1000 logical while ``mss`` sees 3000x2000
+    physical. Handing the logical rect straight to ``mss`` therefore grabs the
+    wrong region: scaled down by the display factor and anchored at the
+    top-left, so the captured image is a cropped top-left slice of what the
+    user selected (a code block loses its body). Scale by ``devicePixelRatio``
+    and clamp to the monitor.
+    """
+    dpr = float(scale) or 1.0
+    m_left = int(monitor.get("left", 0))
+    m_top = int(monitor.get("top", 0))
+    m_right = m_left + int(monitor.get("width", 0))
+    m_bottom = m_top + int(monitor.get("height", 0))
+
+    left = m_left + round(rect.x() * dpr)
+    top = m_top + round(rect.y() * dpr)
+    right = left + max(1, round(rect.width() * dpr))
+    bottom = top + max(1, round(rect.height() * dpr))
+
+    left = max(m_left, min(left, m_right - 1))
+    top = max(m_top, min(top, m_bottom - 1))
+    right = max(left + 1, min(right, m_right))
+    bottom = max(top + 1, min(bottom, m_bottom))
+    return {"left": left, "top": top, "width": right - left, "height": bottom - top}
+
+
 class _SelectionOverlay(QWidget):
     """
     A full-screen, semi-transparent widget that lets the user drag a rectangle.
@@ -59,6 +88,9 @@ class _SelectionOverlay(QWidget):
         # Grab the current desktop screenshot as a background image
         screen: QScreen = QApplication.primaryScreen()
         self._background: QPixmap = screen.grabWindow(0)
+        # Qt works in logical pixels; mss grabs physical pixels. Keep the ratio
+        # so the selection can be converted before the grab (see _physical_box).
+        self.device_pixel_ratio: float = float(screen.devicePixelRatio() or 1.0)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -209,18 +241,18 @@ class AreaCapture:
             logger.info("Area capture cancelled.")
             return None
 
-        return await asyncio.to_thread(AreaCapture._grab_rect_png, rect)
+        scale = overlay.device_pixel_ratio
+        return await asyncio.to_thread(AreaCapture._grab_rect_png, rect, scale)
 
     @staticmethod
-    def _grab_rect_png(rect) -> bytes:
-        logger.info(f"Area selected: {rect.x()},{rect.y()} {rect.width()}x{rect.height()}")
+    def _grab_rect_png(rect, scale: float = 1.0) -> bytes:
+        logger.info(
+            "Area selected (logical): %d,%d %dx%d @%.2fx",
+            rect.x(), rect.y(), rect.width(), rect.height(), scale,
+        )
         with mss.mss() as sct:
-            monitor = {
-                "top": rect.y(),
-                "left": rect.x(),
-                "width": rect.width(),
-                "height": rect.height(),
-            }
+            monitor = _physical_box(rect, sct.monitors[1], scale)
+            logger.info("Grabbing physical region: %s", monitor)
             sct_img = sct.grab(monitor)
             img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         buf = io.BytesIO()
@@ -231,6 +263,21 @@ class AreaCapture:
     def _full_screen_fallback() -> bytes:
         """Falls back to capturing the entire primary monitor when PyQt6 is not available."""
         logger.warning("Using full-screen fallback capture (no area selection).")
+        with mss.mss() as sct:
+            sct_img = sct.grab(sct.monitors[1])
+            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    @staticmethod
+    def capture_full_screen() -> bytes:
+        """Synchronous capture of the entire primary monitor as PNG bytes.
+
+        This is a convenience wrapper used when the user requests a full-screen
+        capture (no area selection). It always captures the primary monitor and
+        returns raw PNG bytes.
+        """
         with mss.mss() as sct:
             sct_img = sct.grab(sct.monitors[1])
             img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")

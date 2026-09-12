@@ -12,6 +12,8 @@ WDA_EXCLUDEFROMCAPTURE = 0x00000011
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_LAYERED = 0x00080000
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
 
 def enable_window_stealth(hwnd: int) -> bool:
     """
@@ -59,6 +61,39 @@ def set_window_interaction_mode(hwnd: int, interactive: bool):
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
     except Exception as e:
         logger.error(f"Failed to set interaction mode: {e}")
+
+def hide_from_taskbar(hwnd: int) -> bool:
+    """
+    Removes the window from the taskbar (and Alt+Tab) by setting WS_EX_TOOLWINDOW
+    and clearing WS_EX_APPWINDOW. Qt already does this for Qt.WindowType.Tool
+    windows; calling it explicitly is idempotent and also covers native handles
+    created outside those flags.
+
+    The ex-style change only takes effect after a frame refresh, hence the
+    SetWindowPos(SWP_FRAMECHANGED) call. Returns True when the style is in place.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        new_style = (ex_style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+        if new_style != ex_style:
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+            user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            logger.info("Window hidden from taskbar (WS_EX_TOOLWINDOW).")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to hide window from taskbar: {e}")
+        return False
 
 # DWM backdrop constants (Windows 11 22H2+)
 DWMWA_SYSTEMBACKDROP_TYPE = 38

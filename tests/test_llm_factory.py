@@ -35,8 +35,6 @@ def cfg(monkeypatch):
     defaults = {
         "TEXT_PROVIDER": "",
         "TEXT_MODEL": "",
-        "VISION_PROVIDER": "",
-        "VISION_MODEL": "",
         "OPENAI_API_KEY": "oai-key",
         "DEEPSEEK_API_KEY": "ds-key",
         "GEMINI_API_KEY": "g-key",
@@ -71,7 +69,7 @@ def test_text_infers_ollama_from_model_prefix(cfg, monkeypatch):
 
 
 def test_text_infers_deepseek_from_model_name(cfg, monkeypatch):
-    monkeypatch.setattr(cfg, "TEXT_MODEL", "deepseek-chat")
+    monkeypatch.setattr(cfg, "TEXT_MODEL", "deepseek-flash")
     p = factory.make_text_provider()
     assert p.label == "deepseek"
     assert p.base_url == "https://api.deepseek.com/v1"
@@ -88,34 +86,6 @@ def test_text_explicit_gemini_uses_gemini_provider(cfg, monkeypatch):
 def test_text_provider_override_wins_over_model_inference(cfg, monkeypatch):
     # Model name suggests deepseek, but explicit provider should win.
     monkeypatch.setattr(cfg, "TEXT_PROVIDER", "openai")
-    monkeypatch.setattr(cfg, "TEXT_MODEL", "deepseek-chat")
+    monkeypatch.setattr(cfg, "TEXT_MODEL", "deepseek-flash")
     p = factory.make_text_provider()
     assert p.label == "openai"
-
-
-# ── Vision provider ──────────────────────────────────────────────────────
-
-def test_vision_default_is_openai(cfg):
-    p = factory.make_vision_provider()
-    assert isinstance(p, _StubOAI)
-    assert p.label == "openai-vision"
-
-
-def test_vision_infers_gemini_from_model(cfg, monkeypatch):
-    monkeypatch.setattr(cfg, "VISION_MODEL", "gemini-2.5-flash")
-    p = factory.make_vision_provider()
-    assert isinstance(p, _StubGem)
-
-
-def test_vision_explicit_gemini_provider(cfg, monkeypatch):
-    monkeypatch.setattr(cfg, "VISION_PROVIDER", "gemini")
-    monkeypatch.setattr(cfg, "VISION_MODEL", "gpt-4o")  # ignored
-    p = factory.make_vision_provider()
-    assert isinstance(p, _StubGem)
-
-
-def test_vision_deepseek_returns_placeholder(cfg, monkeypatch):
-    monkeypatch.setattr(cfg, "VISION_MODEL", "deepseek-vision")
-    p = factory.make_vision_provider()
-    assert isinstance(p, _StubOAI)
-    assert "unsupported" in (p.label or "")

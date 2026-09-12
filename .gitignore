@@ -6,6 +6,8 @@ __pycache__/
 *.pyo
 *.pyd
 *.pyw
+# ...except the shipped console-free launcher (Windows entry point).
+!GhostPilot.pyw
 *.pyz
 *.pywz
 *.pyzw
@@ -14,4 +16,7 @@ __pycache__/
 config.json
 
 knowledge/*
+# ...except the shipped starter cheatsheet: algorithm turns inject it whole, so
+# a clone without it silently answers with no pattern reference at all.
+!knowledge/algorithm.md
 .DS_Store

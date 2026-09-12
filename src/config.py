@@ -64,32 +64,69 @@ class Config:
     WHISPER_WINDOW_SEC = _env_float("WHISPER_WINDOW_SEC", 2.5)
 
     # LLM Settings
-    # Text: DeepSeek-V3 (fast, cheap, great for technical Q&A)
-    TEXT_MODEL = os.getenv("TEXT_MODEL", "deepseek-chat")  # deepseek-chat = DeepSeek-V3
-    # Vision: Gemini 1.5 Flash by default (works with GEMINI_API_KEY out of the box).
-    # Use "gpt-4o" if you prefer OpenAI vision (requires OPENAI_API_KEY).
-    # NOTE: DeepSeek vision models are NOT compatible with this pipeline.
-    VISION_MODEL = os.getenv("VISION_MODEL", "gemini-1.5-flash")
+    # Answer model. DeepSeek-V4.1-Flash ("deepseek-flash") is the current
+    # DeepSeek API model (deepseek-chat was retired in July 2026).
+    TEXT_MODEL = os.getenv("TEXT_MODEL", "deepseek-flash")
 
     # Optional explicit provider override ("openai", "deepseek", "gemini", "ollama").
     # When empty, the engine infers from the model name.
     TEXT_PROVIDER = os.getenv("TEXT_PROVIDER", "")
-    VISION_PROVIDER = os.getenv("VISION_PROVIDER", "")
     # Optional comma-separated fallback chain — used if the primary provider
     # raises before emitting any output. Example: "deepseek,gemini".
     TEXT_PROVIDER_FALLBACK = os.getenv("TEXT_PROVIDER_FALLBACK", "")
-    VISION_PROVIDER_FALLBACK = os.getenv("VISION_PROVIDER_FALLBACK", "")
+
+    # Screenshot OCR runs locally through Ollama (native /api/generate), then
+    # the recognized text is answered by the text model above.
+    #   ollama pull glm-ocr && python setup_glm_ocr.py
+    OCR_MODEL = os.getenv("OCR_MODEL", "glm-ocr-optimized")
+    # The stock "Text recognition:" prompt makes GLM-OCR continue past the page
+    # and repeat itself (measured: one line emitted 164×, 1984 chars, 59-94 s of
+    # decode for text it had already transcribed). Asking for the text alone and
+    # an explicit stop terminates cleanly on the same image in ~12 s with
+    # identical accuracy. Kept configurable because a provider-prefix style
+    # prompt is still needed if you switch to a model without a GLM renderer.
+    OCR_PROMPT = os.getenv("OCR_PROMPT", "Transcribe all text in this image. Output only the text.")
+    # Longest edge (px) the screenshot is scaled to before OCR: downscaled above
+    # it (the vision prefill dominates the latency), upscaled below it (the model
+    # reads small text poorly and falls into a repetition loop).
+    OCR_MAX_DIMENSION = _env_int("OCR_MAX_DIMENSION", 1024)
+    # A small drag-selected region sent at native size (or scaled only to 768) is
+    # unreadable for GLM-OCR, which then loops until the token cap. Normalising
+    # the long edge to the same 1024 keeps it legible; lower this to skip the
+    # upscale and accept that small crops are slower.
+    OCR_MIN_DIMENSION = _env_int("OCR_MIN_DIMENSION", 1024)
+    # CPU OCR takes seconds to minutes; this bounds one recognition request.
+    OCR_TIMEOUT_SEC = _env_float("OCR_TIMEOUT_SEC", 180.0)
+    # Wall-clock budget for one recognition. OCR_TIMEOUT_SEC is the httpx *read*
+    # timeout and never fires while tokens keep arriving, so a looping generation
+    # would otherwise run to the token cap uninterrupted.
+    OCR_TOTAL_TIMEOUT_SEC = _env_float("OCR_TOTAL_TIMEOUT_SEC", 120.0)
+    # Ollama evicts an idle model after 5 minutes by default, and reloading the
+    # 2.2 GB F16 GLM-OCR costs ~30 s on CPU — paid on the next screenshot.
+    # keep_alive holds it resident across a normal interview's gap between shots.
+    OCR_KEEP_ALIVE = os.getenv("OCR_KEEP_ALIVE", "30m")
+    # Hard cap on tokens generated per screenshot. GLM-OCR is greedy
+    # (temperature 0 / top_k 1): on an image it cannot read it latches onto the
+    # last token group and repeats it until the cap. The model's own num_predict
+    # is 8192 — ~13 measured minutes of CPU for one degenerate screenshot.
+    OCR_NUM_PREDICT = _env_int("OCR_NUM_PREDICT", 1024)
+    # Stop consuming a degenerate stream after this many identical trailing lines.
+    OCR_REPEAT_GUARD_LINES = _env_int("OCR_REPEAT_GUARD_LINES", 12)
     # Append-only JSONL usage log. Empty path → ~/.ghostpilot/usage.jsonl.
     USAGE_LOG_ENABLED = (os.getenv("USAGE_LOG_ENABLED", "1").strip().lower()
                          not in {"0", "false", "no", ""})
     USAGE_LOG_PATH = os.getenv("USAGE_LOG_PATH", "")
     # Ollama (local OpenAI-compatible endpoint).
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    # Start a *local* Ollama at launch when it is not already answering. Ollama's
+    # installer registers a Startup-folder shortcut, so this is normally just a
+    # probe; it covers the cases that shortcut does not (quit, crashed, autostart
+    # disabled, or we came up before it finished booting). Never applies to a
+    # remote OLLAMA_BASE_URL. Set to 0 to manage the server yourself.
+    OLLAMA_AUTOSTART = os.getenv("OLLAMA_AUTOSTART", "1")
     # Multi-turn context: number of prior (Q, A) pairs to feed back to the
     # text model. 0 disables history (default — keeps token usage tight).
     CONTEXT_TURNS = _env_int("CONTEXT_TURNS", 0)
-    # Vision screenshot history retained for re-asking / future filmstrip UI.
-    VISION_HISTORY = _env_int("VISION_HISTORY", 5)
 
     # Audio Settings
     SAMPLE_RATE = 16000
@@ -108,12 +145,32 @@ class Config:
     # ASR overlay: keep only the last N Q&A blocks (split by the same separator as append_block). 0 = unlimited.
     ASR_OVERLAY_MAX_CONVERSATIONS = _env_int("ASR_OVERLAY_MAX_CONVERSATIONS", 3)
 
-    # Vision timeout / safety (applies to the whole two-step vision pipeline)
-    VISION_TIMEOUT_SEC = _env_float("VISION_TIMEOUT_SEC", 8.0)
+    # Answer generation output cap. 0 (the default) means UNCAPPED: the provider
+    # applies its own output limit.
+    #
+    # A caller-imposed cap is a trap with reasoning models. `deepseek-flash`
+    # bills its hidden chain-of-thought against this budget *before* writing the
+    # visible answer, and the trace length varies per run. Measured on one
+    # algorithm question: at max_tokens=450 the entire budget went to reasoning
+    # and the answer was empty; at 1200 the same thing happened (1200 reasoning
+    # tokens, 0 characters of answer); uncapped it took 1376 tokens total
+    # (1241 reasoning + the rest answer) and stopped cleanly with the complete
+    # code block. Capping this call therefore cannot be made safe by picking a
+    # bigger number — it only makes truncation less likely, at the cost of
+    # silently losing the answer when the trace runs long.
+    ANSWER_MAX_TOKENS = _env_int("ANSWER_MAX_TOKENS", 0)
 
     # UI Settings
     # 0.0~1.0, higher = more opaque (less transparent)
     OVERLAY_OPACITY = 0.78
+
+    # Which overlay(s) to bring up at launch, and whether to ask first:
+    #   "ask"    → show a chooser dialog on every launch (default)
+    #   "both"   → ASR overlay + Vision overlay (audio/ASR service runs)
+    #   "vision" → Vision overlay only (no audio capture, no ASR service)
+    #   "asr"    → ASR overlay only (no screenshot/vision overlay)
+    # Overridable per launch with `python main.py --overlay vision`.
+    STARTUP_OVERLAY_MODE = os.getenv("STARTUP_OVERLAY_MODE", "ask").strip().lower()
 
     # Response language preference:
     # - "auto": follow question language (use each prompt's built-in rule)
@@ -124,12 +181,27 @@ class Config:
     # RAG: minimum cosine similarity (0–1) to keep a chunk; below threshold chunks are dropped
     RAG_MIN_SCORE = _env_float("RAG_MIN_SCORE", 0.32)
 
+    # Algorithm turns are the one route that does *not* retrieve: an algorithm
+    # question is answered from the patterns cheatsheet, injected whole. Whole
+    # rather than retrieved because a cheatsheet's value is its structure — a
+    # 900-char chunk of it ranks well but reads as a fragment — and because the
+    # route must not depend on retrieval quality (the dense half needs
+    # sentence-transformers; BM25 alone scores a resume chunk against a coding
+    # question too). Name/path is resolved under KNOWLEDGE_DIR, or absolute.
+    ALGORITHM_KNOWLEDGE_FILE = os.getenv("ALGORITHM_KNOWLEDGE_FILE", "algorithm.md")
+    # Safety bound on the whole-file injection (≈2k tokens at the default).
+    # Generous enough that a real cheatsheet is never cut; a larger file is
+    # truncated with a visible marker rather than sent whole or dropped.
+    ALGORITHM_KNOWLEDGE_MAX_CHARS = _env_int("ALGORITHM_KNOWLEDGE_MAX_CHARS", 8000)
+
     # LLM question classifier (text model, non-streaming)
     CLASSIFIER_MAX_TOKENS = _env_int("CLASSIFIER_MAX_TOKENS", 64)
     CLASSIFIER_TEMPERATURE = _env_float("CLASSIFIER_TEMPERATURE", 0.1)
 
     # Hotkeys
     SCREENSHOT_HOTKEY = os.getenv("SCREENSHOT_HOTKEY", "alt+p")
+    # Full-screen screenshot (captures entire primary monitor)
+    SCREENSHOT_FULL_HOTKEY = os.getenv("SCREENSHOT_FULL_HOTKEY", "alt+shift+p")
     # Backward compatible (toggles BOTH overlays together if set)
     INTERACTION_HOTKEY = os.getenv("INTERACTION_HOTKEY", "")
     INTERACTION_HOTKEY_BACKUP = os.getenv("INTERACTION_HOTKEY_BACKUP", "")

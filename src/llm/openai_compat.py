@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import logging
 from typing import AsyncIterator
 
@@ -11,6 +10,17 @@ from openai import AsyncOpenAI
 from src.llm.base import Delta, LLMProvider, Usage
 
 logger = logging.getLogger(__name__)
+
+
+def _limit_kwarg(key: str, value: int | None) -> dict:
+    """Build the output-cap kwarg, omitting it entirely when unset.
+
+    Omitting the key is what makes a call uncapped; passing
+    ``max_tokens=None`` would instead serialise ``"max_tokens": null``. That
+    happens to be tolerated by DeepSeek but is not part of the OpenAI schema, so
+    the field is dropped rather than nulled.
+    """
+    return {} if value is None else {key: value}
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -24,43 +34,42 @@ class OpenAICompatProvider(LLMProvider):
         self.name = label or ("openai" if not base_url else base_url)
         self._base_url = base_url
 
-    async def chat_complete(self, messages, *, model: str, max_tokens: int = 256, temperature: float = 0.1) -> str:
+    async def chat_complete(self, messages, *, model: str, max_tokens: int | None = 256, temperature: float = 0.1) -> str:
         resp = await self._client.chat.completions.create(
-            model=model, messages=messages, max_tokens=max_tokens, temperature=temperature, stream=False,
+            model=model, messages=messages, temperature=temperature, stream=False,
+            **_limit_kwarg("max_tokens", max_tokens),
         )
         return resp.choices[0].message.content or ""
 
-    async def chat_stream(self, messages, *, model: str, max_tokens: int = 512, temperature: float = 0.25) -> AsyncIterator[Delta]:
+    async def chat_stream(self, messages, *, model: str, max_tokens: int | None = None, temperature: float = 0.25) -> AsyncIterator[Delta]:
         stream = await self._client.chat.completions.create(
-            model=model, messages=messages, max_tokens=max_tokens, temperature=temperature,
+            model=model, messages=messages, temperature=temperature,
+            **_limit_kwarg("max_tokens", max_tokens),
             stream=True, stream_options={"include_usage": True} if not self._base_url or "openai" in (self._base_url or "") or "deepseek" in (self._base_url or "") else None,
         )
         try:
             async for chunk in stream:
                 delta_text = ""
+                finish_reason = None
                 if chunk.choices:
-                    delta_text = (chunk.choices[0].delta.content or "") if chunk.choices[0].delta else ""
+                    choice = chunk.choices[0]
+                    delta_text = (choice.delta.content or "") if choice.delta else ""
+                    # Arrives on its own chunk (empty delta), so it must count
+                    # towards "something to yield" or it would be dropped.
+                    finish_reason = getattr(choice, "finish_reason", None)
                 usage = None
                 if getattr(chunk, "usage", None):
+                    details = getattr(chunk.usage, "completion_tokens_details", None)
                     usage = Usage(
                         in_tokens=getattr(chunk.usage, "prompt_tokens", 0) or 0,
                         out_tokens=getattr(chunk.usage, "completion_tokens", 0) or 0,
+                        # Absent on non-reasoning servers; 0 is the right default.
+                        reasoning_tokens=getattr(details, "reasoning_tokens", 0) or 0,
                     )
-                if delta_text or usage:
-                    yield Delta(text=delta_text, usage=usage)
+                if delta_text or usage or finish_reason:
+                    yield Delta(text=delta_text, usage=usage, finish_reason=finish_reason)
         finally:
             try:
                 await stream.close()
             except Exception:
                 pass
-
-    async def vision_stream(self, messages, *, model: str, system_prompt: str, max_tokens: int = 550, temperature: float = 0.25) -> AsyncIterator[Delta]:
-        # `messages` here is already an OpenAI-style content list. The caller
-        # builds it (text + image_url blocks).
-        async for d in self.chat_stream(messages, model=model, max_tokens=max_tokens, temperature=temperature):
-            yield d
-
-    @staticmethod
-    def b64_image_url(image_bytes: bytes, mime: str = "image/jpeg") -> str:
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        return f"data:{mime};base64,{b64}"

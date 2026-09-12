@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections.abc import Callable
 
 import numpy as np
@@ -57,23 +58,69 @@ class RAGManager:
         self._kb_root: str | None = None
         self._kb_params: dict | None = None
         self._kb_mtimes: dict[str, float] = {}
+        # Dense half is loaded on a background thread (see _ensure_model): the
+        # ST/torch import costs seconds, and nothing here blocks on it because
+        # BM25 covers search until the embeddings land.
+        self._dense_lock = threading.Lock()
+        self._dense_loading = False
+        # The `documents` list object the current `embeddings` were built from.
+        self._embedded_for: list[str] | None = None
         # Model is loaded lazily on first load_documents() call with non-empty
         # texts (Phase 5.3). Keeps cold-start fast when no knowledge base.
 
     def _ensure_model(self):
-        if self.model is not None:
+        """Kick off the sentence-transformers load without blocking the caller.
+
+        Importing the ST/torch stack takes seconds — and when torch is broken
+        in the venv it takes those seconds to *fail*, on every launch. BM25
+        needs none of it, so `search` runs lexical-only until the background
+        load finishes, then silently upgrades to hybrid ranking.
+        """
+        if self.model is not None or self._dense_loading:
             return
+        self._dense_loading = True
+        threading.Thread(
+            target=self._load_dense_model, name="rag-dense-load", daemon=True,
+        ).start()
+
+    def _load_dense_model(self):
         _probe_st()
         if not HAS_ST:
             if _ST_IMPORT_ERROR is not None:
                 logger.warning(f"sentence-transformers unavailable (RAG dense disabled): {_ST_IMPORT_ERROR}")
             return
-        logger.info("Loading sentence transformer model for RAG...")
+        logger.info("Loading sentence transformer model for RAG (background)...")
         try:
-            self.model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+            model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
         except Exception as e:
             logger.warning(f"Failed to init sentence-transformers (RAG dense disabled): {e}")
-            self.model = None
+            return
+        self.model = model
+        self._encode_documents()
+
+    def _encode_documents(self):
+        """Embed the current documents and adopt them if the KB hasn't changed.
+
+        Safe to call from either thread: the encode happens outside the lock,
+        and the result is only published while `documents` is still the same
+        list object — so a rebuild racing the background load can't leave
+        embeddings that don't line up with the chunk list.
+        """
+        model, docs = self.model, self.documents
+        if model is None or not docs or self._embedded_for is docs:
+            return
+        try:
+            emb = model.encode(docs, convert_to_numpy=True)
+            # Normalize embeddings for fast cosine similarity
+            emb = emb / np.linalg.norm(emb, axis=1, keepdims=True)
+        except Exception as e:
+            logger.warning(f"Dense embedding failed (RAG dense disabled): {e}")
+            return
+        with self._dense_lock:
+            if self.documents is docs and self._embedded_for is not docs:
+                self.embeddings = emb
+                self._embedded_for = docs
+                logger.info(f"RAG dense index ready: {len(docs)} chunks.")
 
     @classmethod
     def _tokenize(cls, text: str) -> list[str]:
@@ -82,13 +129,17 @@ class RAGManager:
     def load_documents(self, texts: list[str]):
         """Vectorizes and loads documents (Resume, JD) into memory."""
         self.documents = texts
+        # Embeddings belong to the previous chunk list — drop them so `search`
+        # can't rank one KB's documents by another KB's vectors.
+        with self._dense_lock:
+            self.embeddings = None
+            self._embedded_for = None
         logger.info(f"Loaded {len(texts)} documents into RAG memory.")
         if texts:
             self._ensure_model()
-        if self.model and texts:
-            self.embeddings = self.model.encode(self.documents, convert_to_numpy=True)
-            # Normalize embeddings for fast cosine similarity
-            self.embeddings = self.embeddings / np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+            # Warm model (background load already finished) → embed right here.
+            if self.model is not None:
+                self._encode_documents()
         # BM25 index (independent of dense — works even without sentence_transformers).
         if HAS_BM25 and texts:
             self._bm25_tokens = [self._tokenize(t) for t in texts]

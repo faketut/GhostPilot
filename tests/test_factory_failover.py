@@ -1,10 +1,10 @@
-"""Factory wiring: TEXT/VISION_PROVIDER_FALLBACK builds a FailoverProvider."""
+"""Factory wiring: TEXT_PROVIDER_FALLBACK builds a FailoverProvider."""
 from __future__ import annotations
 
 import pytest
 
 from src.config import config
-from src.llm.factory import make_text_provider, make_vision_provider
+from src.llm.factory import make_text_provider
 from src.llm.failover import FailoverProvider
 
 
@@ -12,9 +12,7 @@ from src.llm.failover import FailoverProvider
 def _restore_config():
     keep = {
         "TEXT_PROVIDER": config.TEXT_PROVIDER,
-        "VISION_PROVIDER": config.VISION_PROVIDER,
         "TEXT_PROVIDER_FALLBACK": config.TEXT_PROVIDER_FALLBACK,
-        "VISION_PROVIDER_FALLBACK": config.VISION_PROVIDER_FALLBACK,
     }
     yield
     for k, v in keep.items():
@@ -43,11 +41,3 @@ def test_text_provider_skips_unknown_fallback_names():
     p = make_text_provider()
     assert isinstance(p, FailoverProvider)
     assert [f.name for f in p.fallbacks] == ["openai"]
-
-
-def test_vision_provider_wraps_when_fallback_set():
-    config.VISION_PROVIDER = "openai"
-    config.VISION_PROVIDER_FALLBACK = "gemini"
-    p = make_vision_provider()
-    assert isinstance(p, FailoverProvider)
-    assert [f.name for f in p.fallbacks] == ["gemini"]

@@ -42,6 +42,62 @@ def list_knowledge_files(
     return sorted(set(files))[:max_files]
 
 
+def resolve_knowledge_file(root_dir: str, name: str) -> Path | None:
+    """Locate one knowledge file by name.
+
+    ``name`` may be absolute, a path relative to ``root_dir``, or a bare
+    filename (found at any depth, so ``knowledge/dsa/algorithm.md`` matches
+    ``algorithm.md``). Falls back to the bundle/repo root the same way the RAG
+    index does, so a frozen build resolves it too.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    p = Path(name)
+    if p.is_absolute():
+        return p if p.is_file() else None
+    root = _resolve_root(root_dir)
+    if not root.exists():
+        return None
+    direct = root / p
+    if direct.is_file():
+        return direct
+    matches = sorted(q for q in root.rglob(p.name) if q.is_file())
+    return matches[0] if matches else None
+
+
+def load_knowledge_file(
+    root_dir: str,
+    name: str,
+    *,
+    max_chars: int = 0,
+) -> tuple[str, Path | None]:
+    """Read one knowledge file whole, for injection rather than retrieval.
+
+    Returns ``(text, path)``; ``("", None)`` when the file is missing or
+    unreadable. ``max_chars > 0`` bounds the text — a file over the bound is cut
+    with a visible marker (and a warning), never silently dropped, because an
+    undersized-looking answer would otherwise be indistinguishable from an
+    unreadable one.
+    """
+    path = resolve_knowledge_file(root_dir, name)
+    if path is None:
+        return "", None
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError as e:
+        logger.warning(f"Could not read knowledge file {path}: {e}")
+        return "", None
+    if max_chars > 0 and len(text) > max_chars:
+        logger.warning(
+            "Knowledge file %s is %d chars; injecting the first %d "
+            "(raise ALGORITHM_KNOWLEDGE_MAX_CHARS for more).",
+            path, len(text), max_chars,
+        )
+        text = text[:max_chars].rstrip() + "\n\n[cheatsheet truncated]"
+    return text, path
+
+
 def _chunk_text(text: str, *, chunk_chars: int, overlap_chars: int) -> list[str]:
     """
     Simple character-based chunker with overlap.

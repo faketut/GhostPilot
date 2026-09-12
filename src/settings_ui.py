@@ -8,6 +8,7 @@ without a restart.
 
 import json
 import os
+import sys
 import logging
 from pathlib import Path
 from typing import Callable, Optional
@@ -31,6 +32,33 @@ from src import usage_log
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = "config.json"
+
+
+def save_config_value(key: str, value) -> bool:
+    """Merge one key into ``config.json`` and hot-patch the in-memory ``config``.
+
+    Startup paths (e.g. the overlay chooser's "remember my choice") must
+    persist a single setting without constructing the Settings dialog.
+    Returns False when the file could not be read or written.
+    """
+    data: dict = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load {CONFIG_FILE}: {e}")
+            return False
+    data[key] = value
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Failed to write {CONFIG_FILE}: {e}")
+        return False
+    if hasattr(config, key):
+        setattr(config, key, value)
+    return True
 
 
 def _set_btn_icon_or_text(btn, icon_name: str, *, keep_text: bool = False) -> None:
@@ -128,14 +156,15 @@ _TEXT_PROVIDER_OPTIONS = [
     ("Gemini", "gemini"),
     ("Ollama (local)", "ollama"),
 ]
-_VISION_PROVIDER_OPTIONS = [
-    ("Auto (infer from model name)", ""),
-    ("OpenAI", "openai"),
-    ("Gemini", "gemini"),
-]
 _ASR_BACKEND_OPTIONS = [
     ("Azure Speech (cloud)", "azure"),
     ("faster-whisper (local, offline)", "whisper"),
+]
+_OVERLAY_MODE_OPTIONS = [
+    ("Ask me each launch", "ask"),
+    ("Both overlays (ASR + Vision)", "both"),
+    ("Vision overlay only — no ASR service", "vision"),
+    ("ASR overlay only", "asr"),
 ]
 
 
@@ -147,9 +176,12 @@ class SettingsUI(QDialog):
         self.setWindowTitle("GhostPilot Copilot — Settings")
         self.setMinimumWidth(520)
         self.setStyleSheet(_dark_stylesheet())
+        # Qt.WindowType.Tool keeps the dialog out of the taskbar / Alt+Tab: the
+        # app is tray-only, a settings dialog must not add a taskbar button.
         self.setWindowFlags(
             Qt.WindowType.Dialog
             | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
         )
 
         self._on_saved = on_saved
@@ -175,6 +207,22 @@ class SettingsUI(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
 
         tabs = QTabWidget(self)
+
+        # ── Tab: Startup ──
+        startup = QFormLayout()
+        startup_w = QWidget()
+        startup_w.setLayout(startup)
+        mode_combo = self._add_combo(
+            "STARTUP_OVERLAY_MODE",
+            getattr(config, "STARTUP_OVERLAY_MODE", "ask"),
+            _OVERLAY_MODE_OPTIONS,
+        )
+        mode_combo.setToolTip(
+            "Which overlay GhostPilot opens at launch. \"Vision overlay only\" skips "
+            "audio capture and the ASR service entirely. Applies to the next launch."
+        )
+        startup.addRow("Overlay at launch:", mode_combo)
+        tabs.addTab(startup_w, icons.icon("ghost"), "Startup")
 
         # ── Tab: Azure ──
         azure = QFormLayout()
@@ -205,9 +253,27 @@ class SettingsUI(QDialog):
         llm.addRow("Text model:",       self._add_text("TEXT_MODEL", config.TEXT_MODEL))
         llm.addRow("Context turns (0=off):", self._add_text("CONTEXT_TURNS", str(getattr(config, "CONTEXT_TURNS", 0))))
 
-        llm.addRow(self._section_header("Vision"))
-        llm.addRow("Vision provider:",  self._add_combo("VISION_PROVIDER", getattr(config, "VISION_PROVIDER", ""), _VISION_PROVIDER_OPTIONS))
-        llm.addRow("Vision model:",     self._add_text("VISION_MODEL", config.VISION_MODEL))
+        llm.addRow(self._section_header("Screenshot OCR (local)"))
+        ocr_model = self._add_text("OCR_MODEL", getattr(config, "OCR_MODEL", "glm-ocr-optimized"))
+        ocr_test_btn = QToolButton(); ocr_test_btn.setToolTip("Check Ollama has this OCR model pulled")
+        _set_btn_icon_or_text(ocr_test_btn, "test")
+        ocr_test_status = QLabel(""); ocr_test_status.setMinimumWidth(160)
+        def _test_ocr():
+            ocr_test_btn.setEnabled(False)
+            ocr_test_status.setText("… checking")
+            ocr_test_status.setStyleSheet("color:#9aa; font-size:11px;")
+            settings_tests.run_test(
+                "ocr", self._snapshot_for_test(),
+                lambda ok, msg: self._show_test_result(ocr_test_btn, ocr_test_status, ok, msg),
+            )
+        ocr_test_btn.clicked.connect(_test_ocr)
+        ocr_row = QHBoxLayout()
+        ocr_row.addWidget(ocr_model, 1); ocr_row.addWidget(ocr_test_btn); ocr_row.addWidget(ocr_test_status)
+        ocr_w = QWidget(); ocr_w.setLayout(ocr_row)
+        llm.addRow("OCR model:", ocr_w)
+        llm.addRow("OCR prompt:",   self._add_text("OCR_PROMPT", getattr(config, "OCR_PROMPT", "Text recognition:")))
+        llm.addRow("OCR max edge (px):", self._add_text("OCR_MAX_DIMENSION", str(getattr(config, "OCR_MAX_DIMENSION", 1024))))
+        llm.addRow("OCR timeout (sec):", self._add_text("OCR_TIMEOUT_SEC", str(getattr(config, "OCR_TIMEOUT_SEC", 180.0))))
 
         llm.addRow(self._section_header("API keys"))
         llm.addRow("OpenAI API key:",   self._add_secret("OPENAI_API_KEY", config.OPENAI_API_KEY, test="openai"))
@@ -247,7 +313,7 @@ class SettingsUI(QDialog):
         llm.addRow("Ollama base URL:", ollama_w)
         self._track_scoped(llm, "OLLAMA_BASE_URL")
 
-        # ── Master test (selected text + vision providers) ──
+        # ── Master test (text provider + local screenshot OCR) ──
         test_row = QHBoxLayout()
         test_btn = QPushButton("Test selected providers")
         _set_btn_icon_or_text(test_btn, "test", keep_text=True)
@@ -255,12 +321,12 @@ class SettingsUI(QDialog):
         test_status.setStyleSheet("color:#9aa; font-size:11px;")
         test_row.addWidget(test_btn); test_row.addWidget(test_status, 1)
 
-        def _resolve_provider(combo_val: str, model: str, is_vision: bool) -> str:
+        def _resolve_provider(combo_val: str, model: str) -> str:
             v = (combo_val or "").strip().lower()
             if v:
                 return v
             m = (model or "").lower()
-            if not is_vision and (m.startswith("ollama/") or m.startswith("llama") or m.startswith("qwen") or m.startswith("mistral") or m.startswith("phi")):
+            if m.startswith(("ollama/", "llama", "qwen", "mistral", "phi")):
                 return "ollama"
             if "deepseek" in m:
                 return "deepseek"
@@ -270,25 +336,24 @@ class SettingsUI(QDialog):
 
         def _run_master_test():
             test_btn.setEnabled(False)
-            test_status.setText("… testing text + vision")
+            test_status.setText("… testing text + OCR")
             test_status.setStyleSheet("color:#9aa; font-size:11px;")
             params = self._snapshot_for_test()
-            text_p = _resolve_provider(params.get("TEXT_PROVIDER", ""), params.get("TEXT_MODEL", ""), is_vision=False)
-            vis_p = _resolve_provider(params.get("VISION_PROVIDER", ""), params.get("VISION_MODEL", ""), is_vision=True)
+            text_p = _resolve_provider(params.get("TEXT_PROVIDER", ""), params.get("TEXT_MODEL", ""))
             results: dict[str, tuple[bool, str]] = {}
 
             def _maybe_done():
-                if "text" in results and "vision" in results:
+                if "text" in results and "ocr" in results:
                     test_btn.setEnabled(True)
                     ok_t, msg_t = results["text"]
-                    ok_v, msg_v = results["vision"]
-                    ok = ok_t and ok_v
-                    text = f"text({text_p}): {'✓' if ok_t else '✗'} {msg_t}  ·  vision({vis_p}): {'✓' if ok_v else '✗'} {msg_v}"
+                    ok_o, msg_o = results["ocr"]
+                    ok = ok_t and ok_o
+                    text = f"text({text_p}): {'✓' if ok_t else '✗'} {msg_t}  ·  ocr: {'✓' if ok_o else '✗'} {msg_o}"
                     test_status.setText(text)
                     test_status.setStyleSheet(f"color:{'#6c6' if ok else '#c66'}; font-size:11px;")
 
             settings_tests.run_test(text_p, params, lambda ok, msg: (results.__setitem__("text", (ok, msg)), _maybe_done()))
-            settings_tests.run_test(vis_p, params, lambda ok, msg: (results.__setitem__("vision", (ok, msg)), _maybe_done()))
+            settings_tests.run_test("ocr", params, lambda ok, msg: (results.__setitem__("ocr", (ok, msg)), _maybe_done()))
 
         test_btn.clicked.connect(_run_master_test)
         test_w = QWidget(); test_w.setLayout(test_row)
@@ -299,7 +364,8 @@ class SettingsUI(QDialog):
         hk = QFormLayout()
         hk_w = QWidget()
         hk_w.setLayout(hk)
-        hk.addRow("Screenshot (Vision):",        self._add_text("SCREENSHOT_HOTKEY", config.SCREENSHOT_HOTKEY))
+        hk.addRow("Screenshot (OCR):",           self._add_text("SCREENSHOT_HOTKEY", config.SCREENSHOT_HOTKEY))
+        hk.addRow("Screenshot (Full-screen):",  self._add_text("SCREENSHOT_FULL_HOTKEY", getattr(config, "SCREENSHOT_FULL_HOTKEY", "")))
         hk.addRow("Both overlays (primary):",    self._add_text("ASR_INTERACTION_HOTKEY", config.ASR_INTERACTION_HOTKEY))
         hk.addRow("Both overlays (backup):",     self._add_text("ASR_INTERACTION_HOTKEY_BACKUP", config.ASR_INTERACTION_HOTKEY_BACKUP))
         hk.addRow("Vision overlay (primary):",   self._add_text("VISION_INTERACTION_HOTKEY", config.VISION_INTERACTION_HOTKEY))
@@ -348,6 +414,14 @@ class SettingsUI(QDialog):
         btn_row.addWidget(save_btn)
         root.addLayout(btn_row)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if sys.platform == "win32":
+            # Explicit WS_EX_TOOLWINDOW: no taskbar button even if the platform
+            # theme gives the dialog a caption.
+            from src.windows_api import hide_from_taskbar
+            hide_from_taskbar(int(self.winId()))
+
     # ── Provider-scoped row visibility ───────────────────────────────────
 
     def _track_scoped(self, layout: QFormLayout, key: str) -> None:
@@ -356,14 +430,13 @@ class SettingsUI(QDialog):
 
     def _wire_visibility(self) -> None:
         # Recompute whenever the user changes any provider hint.
-        for key in ("TEXT_PROVIDER", "VISION_PROVIDER", "ASR_BACKEND"):
+        for key in ("TEXT_PROVIDER", "ASR_BACKEND"):
             w = self._fields.get(key, (None, None))[1]
             if isinstance(w, QComboBox):
                 w.currentIndexChanged.connect(lambda _i: self._refresh_visibility())
-        for key in ("TEXT_MODEL", "VISION_MODEL"):
-            w = self._fields.get(key, (None, None))[1]
-            if isinstance(w, QLineEdit):
-                w.textChanged.connect(lambda _t: self._refresh_visibility())
+        w = self._fields.get("TEXT_MODEL", (None, None))[1]
+        if isinstance(w, QLineEdit):
+            w.textChanged.connect(lambda _t: self._refresh_visibility())
 
     def _resolve_text_provider(self) -> str:
         combo = self._fields.get("TEXT_PROVIDER", (None, None))[1]
@@ -381,18 +454,6 @@ class SettingsUI(QDialog):
             return "gemini"
         return "openai"
 
-    def _resolve_vision_provider(self) -> str:
-        combo = self._fields.get("VISION_PROVIDER", (None, None))[1]
-        v = (combo.currentData() if isinstance(combo, QComboBox) else "") or ""
-        v = v.strip().lower()
-        if v:
-            return v
-        m_field = self._fields.get("VISION_MODEL", (None, None))[1]
-        m = (m_field.text() if isinstance(m_field, QLineEdit) else "").lower()
-        if "gemini" in m:
-            return "gemini"
-        return "openai"
-
     def _resolve_asr_backend(self) -> str:
         combo = self._fields.get("ASR_BACKEND", (None, None))[1]
         v = (combo.currentData() if isinstance(combo, QComboBox) else "") or "azure"
@@ -400,13 +461,13 @@ class SettingsUI(QDialog):
 
     def _refresh_visibility(self) -> None:
         t = self._resolve_text_provider()
-        v = self._resolve_vision_provider()
         a = self._resolve_asr_backend()
         show = {
-            "OPENAI_API_KEY":      t == "openai" or v == "openai",
+            "OPENAI_API_KEY":      t == "openai",
             "DEEPSEEK_API_KEY":    t == "deepseek",
-            "GEMINI_API_KEY":      t == "gemini" or v == "gemini",
-            "OLLAMA_BASE_URL":     t == "ollama",
+            "GEMINI_API_KEY":      t == "gemini",
+            # Screenshot OCR always talks to the local Ollama server.
+            "OLLAMA_BASE_URL":     True,
             "AZURE_SPEECH_KEY":    a == "azure",
             "AZURE_SPEECH_REGION": a == "azure",
             "AZURE_SPEECH_ENDPOINT": a == "azure",

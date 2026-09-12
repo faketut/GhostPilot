@@ -8,7 +8,9 @@ File → question type mapping:
     prompts/algorithm.md  →  "algorithm"
     prompts/technical.md  →  "technical"
     prompts/behavioral.md →  "behavioral"
-    prompts/vision.md     →  "vision"
+
+Screenshots have no separate prompt: local OCR transcribes them and the
+recognized text is classified into one of the three types above.
 
 If a file is missing, a sensible inline fallback is used so the app never crashes.
 """
@@ -56,11 +58,6 @@ _FALLBACKS: dict[str, str] = {
         "You are a behavioral coach. Exactly four lines: either STAR [S][T][A][R] for a past story, "
         "or WYEC [W][Y][E][C] for motivation/why-us/fit/self-pitch. "
         "Chinese unless the question is clearly English."
-    ),
-    "vision": (
-        "You analyze interview screenshots. First line: 题目类型: behavioral|technical|algorithm|other. "
-        "Then use the same letter format as that type (behavioral: STAR or WYEC four lines; technical: one tabbed line; "
-        "algorithm: UMP + [I] + code + [R]). Chinese unless the question is clearly English."
     ),
 }
 

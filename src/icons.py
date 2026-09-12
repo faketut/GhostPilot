@@ -9,9 +9,16 @@ Usage:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtGui import QIcon
+
+# Bundled assets (icons/). Frozen builds extract to sys._MEIPASS; source runs
+# use the repo root, one level up from src/.
+_BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+APP_ICON_PATH = _BASE_DIR / "assets" / "icon.ico"
 
 try:
     import qtawesome as qta  # type: ignore
@@ -70,3 +77,20 @@ def emoji_fallback(name: str) -> str:
     """Return the emoji fallback for `name` (for environments without qtawesome)."""
     _, em = _NAMES.get(name, ("", ""))
     return em
+
+
+def app_icon() -> QIcon:
+    """The GhostPilot application icon: tray, taskbar grouping and dialogs.
+
+    Falls back to the qtawesome ghost glyph when the .ico is missing (e.g. a
+    dev checkout without assets/), and to an empty QIcon when neither exists —
+    callers must handle a null QIcon.
+    """
+    if APP_ICON_PATH.exists():
+        ic = QIcon(str(APP_ICON_PATH))
+        if not ic.isNull():
+            return ic
+    glyph = icon("ghost", color="#00C850")
+    if not glyph.isNull():
+        return glyph
+    return QIcon()

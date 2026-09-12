@@ -97,20 +97,26 @@ def iter_turns(session_dir: Path) -> Iterator[Turn]:
     """Walk ``llm.jsonl`` and yield one :class:`Turn` per user question.
 
     Pairing rule: a ``user`` row consumes the first following ``assistant``
-    row (with optional ``screenshot`` rows in between). Stray rows are
-    skipped — the recorder writes them in order but be defensive.
+    row, plus any ``screenshot`` row adjacent to it. Recorders have written the
+    screenshot both before and after the user row, so an unpaired screenshot is
+    carried forward onto the next user turn. Stray rows are skipped.
     """
     rows = _load_rows(session_dir)
     pending: Optional[dict] = None
     pending_shot: Optional[dict] = None
+    orphan_shot: Optional[dict] = None
     for r in rows:
         role = r.get("role")
         if role == "user":
             # If a previous user turn never got an assistant, drop it.
             pending = r
-            pending_shot = None
-        elif role == "screenshot" and pending is not None:
-            pending_shot = r
+            pending_shot = orphan_shot
+            orphan_shot = None
+        elif role == "screenshot":
+            if pending is not None:
+                pending_shot = r
+            else:
+                orphan_shot = r
         elif role == "assistant" and pending is not None:
             shot_path: Optional[Path] = None
             shot_bytes: Optional[bytes] = None

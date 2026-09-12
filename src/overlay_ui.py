@@ -27,12 +27,15 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
 from PyQt6.QtGui import (
     QColor, QIcon, QPixmap, QPainter, QBrush, QGuiApplication, QTextCursor,
-    QShortcut, QKeySequence,
+    QShortcut, QKeySequence, QAction,
 )
 
-from src.windows_api import enable_window_stealth, set_window_interaction_mode, enable_mica
+from src.windows_api import (
+    enable_window_stealth, set_window_interaction_mode, enable_mica, hide_from_taskbar,
+)
 from src.config import config
 from src.settings_ui import SettingsUI
+from src import autostart
 from src import theme
 from src import icons
 
@@ -50,13 +53,86 @@ except Exception:
     HAS_PYGMENTS = False
 
 # Precompiled Markdown regexes (perf — issue #16)
-_RE_FENCE = re.compile(r"```(\w*)\n([\s\S]*?)```")
+# The trailing alternation accepts an unterminated fence (`\Z`): a code block
+# that is still streaming has no closing ``` yet, and must still render as code
+# — otherwise the raw lines fall through to the inline renderer, which collapses
+# their indentation and their structure is lost.
+_RE_FENCE = re.compile(r"```(\w*)\n([\s\S]*?)(```|\Z)")
 _RE_INLINE = re.compile(r"`([^`]+)`")
 _RE_BOLD = re.compile(r"\*\*(.+?)\*\*")
+# Whitespace that HTML would otherwise collapse: leading indentation, tab
+# separators, and runs of 2+ spaces (aligned columns in plain-text answers).
+_RE_WS = re.compile(r"(?m)^[ \t]+|\t| {2,}")
 
 CONFIG_FILE = "config.json"
 _GEOMETRY_SAVE_DEBOUNCE_MS = 500
 _STICKY_BOTTOM_TOLERANCE_PX = 4
+
+
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ws_to_nbsp(m: "re.Match[str]") -> str:
+    """Keep whitespace visible: `&nbsp;` per space, 4 per tab.
+
+    Substituted before any tag is inserted, so CSS attribute values are never
+    touched. A tab is a column separator in this app's prompts (`[R]…\t[E]…`),
+    hence the wider cell.
+    """
+    return "".join("&nbsp;" * 4 if ch == "\t" else "&nbsp;" for ch in m.group(0))
+
+
+def _fence_unterminated(text: str) -> bool:
+    """True while `text` ends inside an open ``` fence (mid-stream)."""
+    last = None
+    for m in _RE_FENCE.finditer(text):
+        last = m
+    return last is not None and last.group(3) == ""
+
+
+def _md_inline(raw: str, pal: dict) -> str:
+    """Inline formatting for a non-code segment."""
+    s = _escape_html(raw)
+    s = _RE_WS.sub(_ws_to_nbsp, s)
+    s = _RE_INLINE.sub(
+        f'<code style="background:{pal["code_inline_bg"]};border-radius:3px;'
+        f'padding:1px 4px;font-family:Consolas,monospace;color:{pal["code_inline"]};">'
+        r'\1</code>',
+        s,
+    )
+    s = _RE_BOLD.sub(r"<b>\1</b>", s)
+    return s.replace("\n", "<br>")
+
+
+def _code_block(lang: str, raw_code: str, pal: dict) -> str:
+    """A fenced code block, indentation intact.
+
+    Pygments is handed the *unescaped* source — it escapes what it emits, so
+    pre-escaping here would double-escape every `<`/`&` into literal `&lt;`.
+    """
+    lang = (lang or "text").strip()
+    code = raw_code.rstrip()
+    inner = None
+    if HAS_PYGMENTS:
+        try:
+            lexer = _pyg_get_lexer(lang.lower() or "text")
+            inner = _pyg_highlight(code, lexer, _PYG_FORMATTER)
+        except _PygClassNotFound:
+            inner = None
+        except Exception:
+            inner = None
+    if inner is None:
+        inner = (
+            f'<pre style="margin:0;color:{pal["code_text"]};font-family:Consolas,monospace;'
+            f'font-size:12px;white-space:pre-wrap;">{_escape_html(code)}</pre>'
+        )
+    return (
+        f'<div style="background:{pal["code_bg"]};border-radius:6px;'
+        f'border:1px solid {pal["border"]};margin:6px 0;padding:8px 12px;">'
+        f'<span style="color:{pal["code_lang"]};font-size:10px;">{_escape_html(lang)}</span>'
+        f'{inner}</div>'
+    )
 
 
 # Badge colours per question type (label + base hex; alpha applied at runtime)
@@ -74,6 +150,44 @@ def _clamp01(x: float) -> float:
     except Exception:
         return 1.0
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+
+def _add_menu_action(
+    menu: QMenu,
+    text: str,
+    slot,
+    *,
+    checkable: bool = False,
+    icon: QIcon | None = None,
+) -> QAction:
+    """Create and attach a menu/tray action. Use this, not the convenience overload.
+
+    ``QMenu.addAction(text, callable)`` is a trap in PyQt6:
+
+    * it invokes the callable with **no arguments**, so a slot declared
+      ``def slot(self, checked)`` raises ``TypeError: missing 1 required
+      positional argument``; and a checkable item's slot therefore never
+      receives its new state at all;
+    * with the stock ``sys.excepthook``, PyQt turns *any* unhandled exception
+      raised inside a C++-invoked slot into ``qFatal()``/``abort()``: the
+      process dies with exit code 0xC0000409 (bash reports 9) and, under
+      ``pythonw``, without a traceback — a silent death.
+
+    ``QAction.triggered.connect`` adapts to the callable's arity instead, so
+    ``slot()``, ``slot(checked)`` and ``slot(checked=False)`` all work, and a
+    checkable action's slot gets the new checked state.
+
+    Slot exceptions still propagate to ``sys.excepthook``; ``crash_logger``
+    installs one at startup, which downgrades them from abort to a logged
+    CRITICAL error (see its module docstring).
+    """
+    action = QAction(text, menu)
+    action.setCheckable(checkable)
+    if icon is not None and not icon.isNull():
+        action.setIcon(icon)
+    action.triggered.connect(slot)
+    menu.addAction(action)
+    return action
 
 
 class _PulseDot(QWidget):
@@ -374,6 +488,9 @@ class OverlayUI(QMainWindow):
             self.show()
             hwnd = int(self.winId())
             enable_window_stealth(hwnd)
+            # Tray-only: no taskbar button / Alt+Tab entry (belt & braces on top
+            # of Qt.WindowType.Tool).
+            hide_from_taskbar(hwnd)
             enable_mica(hwnd, acrylic=True)
             self.is_interactive = False
             set_window_interaction_mode(hwnd, False)
@@ -466,8 +583,14 @@ class OverlayUI(QMainWindow):
         self._header.set_lock_state(self.is_interactive)
 
     def _build_footer_text(self) -> str:
-        bits = [
-            f"{config.SCREENSHOT_HOTKEY} screenshot",
+        bits = []
+        ss = getattr(config, "SCREENSHOT_HOTKEY", "")
+        ss_full = getattr(config, "SCREENSHOT_FULL_HOTKEY", "")
+        if ss:
+            bits.append(f"{ss} screenshot")
+        if ss_full:
+            bits.append(f"{ss_full} full")
+        bits += [
             f"{getattr(config, 'ASR_INTERACTION_HOTKEY', 'alt+a')} drag",
             f"{getattr(config, 'FORCE_STEALTH_HOTKEY', 'alt+s')} stealth",
         ]
@@ -491,13 +614,24 @@ class OverlayUI(QMainWindow):
         self._usage_text = text or ""
         self.refresh_footer()
 
-    def set_info_footer(self, provider: str = "", rag_hits: int | None = None) -> None:
-        """Display a small "provider · rag:N" status in the footer."""
+    def set_info_footer(
+        self,
+        provider: str = "",
+        rag_hits: int | None = None,
+        algo_chars: int = 0,
+    ) -> None:
+        """Display a small "provider · rag:N · algo:Nc" status in the footer.
+
+        ``rag:N`` counts retrieved snippets; ``algo:Nc`` reports the algorithm
+        cheatsheet injected whole (characters), shown only when one was sent.
+        """
         parts = []
         if provider:
             parts.append(provider)
         if rag_hits is not None:
             parts.append(f"rag:{rag_hits}")
+        if algo_chars:
+            parts.append(f"algo:{algo_chars}c")
         self._info_text = "  ·  ".join(parts)
         self.refresh_footer()
 
@@ -516,22 +650,35 @@ class OverlayUI(QMainWindow):
     # ── Tray / settings ──────────────────────────────────────────────────
 
     def _init_tray(self):
-        px = QPixmap(32, 32)
-        px.fill(QColor(0, 200, 80))
-        tray = QSystemTrayIcon(QIcon(px), self)
+        tray_icon = icons.app_icon()
+        if tray_icon.isNull():
+            # Last resort: the legacy placeholder square (no assets/icon.ico and
+            # no qtawesome) so the tray entry always has *something*.
+            px = QPixmap(32, 32)
+            px.fill(QColor(0, 200, 80))
+            tray_icon = QIcon(px)
+        tray = QSystemTrayIcon(tray_icon, self)
         tray.setToolTip("GhostPilot Copilot")
         menu = QMenu()
-        settings_act = menu.addAction("Settings", self._open_settings)
-        ic_settings = icons.icon("settings")
-        if not ic_settings.isNull():
-            settings_act.setIcon(ic_settings)
+        _add_menu_action(
+            menu, "Settings", self._open_settings, icon=icons.icon("settings"),
+        )
         menu.addSeparator()
-        self._record_action = menu.addAction("Start recording", self._toggle_recording)
-        ic_rec = icons.icon("record", color="#d32f2f")
-        if not ic_rec.isNull():
-            self._record_action.setIcon(ic_rec)
+        self._record_action = _add_menu_action(
+            menu, "Start recording", self._toggle_recording,
+            icon=icons.icon("record", color="#d32f2f"),
+        )
         menu.addSeparator()
-        menu.addAction("Quit", QApplication.instance().quit)
+        # Background-service equivalent: come up with the user session (no
+        # console, no taskbar button). Windows-only — registry Run key.
+        self._autostart_action = _add_menu_action(
+            menu, "Start with Windows", self._toggle_autostart, checkable=True,
+        )
+        self._autostart_action.setChecked(autostart.is_enabled())
+        if sys.platform != "win32":
+            self._autostart_action.setEnabled(False)
+        menu.addSeparator()
+        _add_menu_action(menu, "Quit", QApplication.instance().quit)
         tray.setContextMenu(menu)
         tray.show()
         self._tray = tray
@@ -560,6 +707,17 @@ class OverlayUI(QMainWindow):
         dlg = SettingsUI(self, on_saved=self._on_settings_saved, on_rebuild_kb=self._on_rebuild_kb,
                          on_replay_session=self._on_replay_session)
         dlg.exec()
+
+    def _toggle_autostart(self, checked: bool) -> None:
+        if autostart.set_enabled(bool(checked)):
+            self._flash_bottom_status(
+                "GhostPilot will start with Windows" if checked else "GhostPilot will not start with Windows",
+                duration_ms=2500,
+            )
+        else:
+            # Roll the checkmark back to the registry's actual state.
+            self._autostart_action.setChecked(autostart.is_enabled())
+            self._flash_bottom_status("Could not update the Windows autostart entry", duration_ms=3000)
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -608,11 +766,12 @@ class OverlayUI(QMainWindow):
 
     def append_block(self, text: str):
         """Append a new conversation block (keeps history)."""
+        was_open = _fence_unterminated(self._full_text)
         if self._full_text:
             self._full_text += self.CONVERSATION_BLOCK_SEP
         self._full_text += text
         trimmed = self._trim_conversation_blocks()
-        if trimmed:
+        if trimmed or was_open or _fence_unterminated(self._full_text):
             self._rerender_full()
         else:
             # Append only the new content's HTML.
@@ -677,14 +836,19 @@ class OverlayUI(QMainWindow):
         """Receives streamed tokens from the UI queue (perf — issue #16)."""
         if not append:
             self._full_text = text
-            trimmed = False
             self._content.clear()
             if text:
-                self._append_delta_html(text)
+                self._rerender_full()
         else:
+            # A code block arrives one token at a time. Deltas can't be rendered
+            # in isolation — the fence spans them, so an open block would be
+            # appended as inline text and lose its indentation. Re-render the
+            # tail-relative block until the fence closes; outside code we keep
+            # the cheap delta-append path.
+            was_open = _fence_unterminated(self._full_text)
             self._full_text += text
             trimmed = self._trim_conversation_blocks()
-            if trimmed:
+            if trimmed or was_open or _fence_unterminated(self._full_text):
                 self._rerender_full()
             elif text:
                 self._append_delta_html(text)
@@ -719,48 +883,19 @@ class OverlayUI(QMainWindow):
         Lightweight Markdown-to-HTML: handles **bold**, `code`, fenced code
         blocks (with optional Pygments syntax highlighting), and line breaks.
         Uses module-level precompiled regexes.
+
+        Fenced blocks are segmented out *before* any inline pass runs, so code
+        keeps its indentation, its `**`/backticks, and its literal `<`/`&`.
         """
         pal = theme.palette()
-
-        # Escape HTML special chars first
-        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        def replace_fence(m):
-            lang = m.group(1) or "text"
-            code = m.group(2).rstrip()
-            if HAS_PYGMENTS:
-                try:
-                    lexer = _pyg_get_lexer(lang.strip().lower() or "text")
-                    inner = _pyg_highlight(code, lexer, _PYG_FORMATTER)
-                    return (
-                        f'<div style="background:{pal["code_bg"]};border-radius:6px;'
-                        f'border:1px solid {pal["border"]};margin:6px 0;padding:8px 12px;">'
-                        f'<span style="color:{pal["code_lang"]};font-size:10px;">{lang}</span>'
-                        f'{inner}</div>'
-                    )
-                except _PygClassNotFound:
-                    pass
-                except Exception:
-                    pass
-            return (
-                f'<div style="background:{pal["code_bg"]};border-radius:6px;'
-                f'border:1px solid {pal["border"]};margin:6px 0;padding:8px 12px;">'
-                f'<span style="color:{pal["code_lang"]};font-size:10px;">{lang}</span><br>'
-                f'<pre style="margin:0;color:{pal["code_text"]};font-family:Consolas,monospace;'
-                f'font-size:12px;white-space:pre-wrap;">{code}</pre></div>'
-            )
-        text = _RE_FENCE.sub(replace_fence, text)
-
-        text = _RE_INLINE.sub(
-            f'<code style="background:{pal["code_inline_bg"]};border-radius:3px;'
-            f'padding:1px 4px;font-family:Consolas,monospace;color:{pal["code_inline"]};">'
-            r'\1</code>',
-            text,
-        )
-        text = _RE_BOLD.sub(r"<b>\1</b>", text)
-        text = text.replace("\n", "<br>")
-
-        return f'<span style="color:{pal["text_primary"]}">{text}</span>'
+        parts: list[str] = []
+        pos = 0
+        for m in _RE_FENCE.finditer(text):
+            parts.append(_md_inline(text[pos:m.start()], pal))
+            parts.append(_code_block(m.group(1), m.group(2), pal))
+            pos = m.end()
+        parts.append(_md_inline(text[pos:], pal))
+        return f'<span style="color:{pal["text_primary"]}">{"".join(parts)}</span>'
 
     # ── Interaction / stealth ────────────────────────────────────────────
 

@@ -8,6 +8,13 @@ Otherwise:  ~/.local/share/GhostPilot/logs/crash.log
 Installs both `sys.excepthook` and a Qt message handler. The asyncio loop's
 exception handler is wired separately in main.py because it needs the loop
 instance.
+
+The installed `sys.excepthook` is also what keeps PyQt slot bugs survivable:
+with the stock excepthook, an unhandled exception raised inside a slot invoked
+from C++ makes PyQt6 call qFatal()/abort(), killing the process with exit code
+0xC0000409 and no traceback (silent under pythonw). With a custom excepthook it
+is reported and the app keeps running. So `install()` MUST run before any Qt
+object is created — main.py calls it early in `main()` for exactly that reason.
 """
 
 from __future__ import annotations
@@ -38,8 +45,12 @@ def crash_log_path() -> Path:
     return _log_dir() / "crash.log"
 
 
-def install() -> Path | None:
-    """Attach the rotating file handler + excepthook. Idempotent."""
+def install(level: int = logging.WARNING) -> Path | None:
+    """Attach the rotating file handler + excepthook. Idempotent.
+
+    ``level`` is the file handler's threshold; background (console-less) runs
+    pass INFO so the service still leaves a log trail.
+    """
     global _installed
     if _installed:
         return crash_log_path()
@@ -50,7 +61,7 @@ def install() -> Path | None:
         handler = RotatingFileHandler(
             path, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
         )
-        handler.setLevel(logging.WARNING)
+        handler.setLevel(level)
         handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

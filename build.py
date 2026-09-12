@@ -34,8 +34,10 @@ BUILD_DIR    = "build"
 
 # Data files to bundle (src → dest_folder_in_bundle)
 EXTRA_DATA = [
+    ("assets", "assets"),
     ("prompts", "prompts"),
     ("knowledge", "knowledge"),
+    ("ocr", "ocr"),
 ]
 
 # Hidden imports that PyInstaller sometimes misses
@@ -74,6 +76,7 @@ HIDDEN_IMPORTS = [
     "src.llm.openai_compat",
     "src.llm.gemini",
     "src.llm.pricing",
+    "src.ocr_client",
     "src.session_recorder",
     "src.crash_logger",
     "src.secret_store",

@@ -10,6 +10,15 @@ from src.llm.base import Delta, LLMProvider, Usage
 logger = logging.getLogger(__name__)
 
 
+def _gemini_limit(value: int | None) -> dict:
+    """Output-cap field for a GenerateContentConfig, or nothing when uncapped.
+
+    google-genai requires an explicit value in the config dict, so an absent
+    field (rather than a `None`) is what leaves the model on its own limit.
+    """
+    return {} if value is None else {"max_output_tokens": value}
+
+
 class GeminiProvider(LLMProvider):
     name = "gemini"
 
@@ -33,59 +42,43 @@ class GeminiProvider(LLMProvider):
             out_tokens=getattr(um, "candidates_token_count", 0) or 0,
         )
 
-    async def chat_complete(self, messages, *, model: str, max_tokens: int = 256, temperature: float = 0.1) -> str:
+    async def chat_complete(self, messages, *, model: str, max_tokens: int | None = 256, temperature: float = 0.1) -> str:
         from google.genai import types
         client = self._ensure_client()
         # `messages` is OpenAI-style; flatten to one text input for the classifier.
         text = "\n\n".join(m.get("content", "") for m in messages if isinstance(m.get("content"), str))
         resp = await client.aio.models.generate_content(
             model=model, contents=text,
-            config=types.GenerateContentConfig(max_output_tokens=max_tokens, temperature=temperature),
+            config=types.GenerateContentConfig(
+                temperature=temperature, **_gemini_limit(max_tokens),
+            ),
         )
         return getattr(resp, "text", "") or ""
 
-    async def chat_stream(self, messages, *, model: str, max_tokens: int = 512, temperature: float = 0.25) -> AsyncIterator[Delta]:
-        # Text-only — used rarely (most Gemini use is vision).
+    async def chat_stream(self, messages, *, model: str, max_tokens: int | None = None, temperature: float = 0.25) -> AsyncIterator[Delta]:
         from google.genai import types
         client = self._ensure_client()
         text = "\n\n".join(m.get("content", "") for m in messages if isinstance(m.get("content"), str))
         stream = await client.aio.models.generate_content_stream(
             model=model, contents=text,
-            config=types.GenerateContentConfig(max_output_tokens=max_tokens, temperature=temperature),
+            config=types.GenerateContentConfig(
+                temperature=temperature, **_gemini_limit(max_tokens),
+            ),
         )
         try:
             async for chunk in stream:
                 t = getattr(chunk, "text", "") or ""
                 usage = self._usage_from(chunk)
-                if t or usage:
-                    yield Delta(text=t, usage=usage)
-        finally:
-            close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
-            if close:
-                try:
-                    res = close()
-                    if hasattr(res, "__await__"):
-                        await res
-                except Exception:
-                    pass
-
-    async def vision_stream(self, contents, *, model: str, system_prompt: str, max_tokens: int = 550, temperature: float = 0.25) -> AsyncIterator[Delta]:
-        from google.genai import types
-        client = self._ensure_client()
-        cfg = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            max_output_tokens=max_tokens,
-            temperature=temperature,
-        )
-        stream = await client.aio.models.generate_content_stream(
-            model=model, contents=contents, config=cfg,
-        )
-        try:
-            async for chunk in stream:
-                t = getattr(chunk, "text", "") or ""
-                usage = self._usage_from(chunk)
-                if t or usage:
-                    yield Delta(text=t, usage=usage)
+                finish_reason = None
+                candidates = getattr(chunk, "candidates", None) or []
+                if candidates:
+                    fr = getattr(candidates[0], "finish_reason", None)
+                    if fr is not None:
+                        # google-genai reports an enum; its str() form is the
+                        # readable name (e.g. "FinishReason.MAX_TOKENS").
+                        finish_reason = getattr(fr, "name", None) or str(fr).rsplit(".", 1)[-1]
+                if t or usage or finish_reason:
+                    yield Delta(text=t, usage=usage, finish_reason=finish_reason)
         finally:
             close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
             if close:

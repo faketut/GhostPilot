@@ -1,7 +1,112 @@
+# ruff: noqa: E402 — the bootstrap block below must execute before the src.*
+# imports: src.config resolves .env / config.json relative to the working
+# directory, which is not the app root for a login (autostart) launch.
 import sys
 import logging
 import asyncio
 import os
+from pathlib import Path
+
+# ── Bootstrap ──────────────────────────────────────────────────────────────
+# GhostPilot is meant to run as a tray-resident background app: launched at
+# login (or detached from a shell) it must resolve config.json, .env,
+# knowledge/ and prompts/ relative to the install, not to whatever directory
+# Windows happened to start it in (C:\Windows\system32 for a Run-key entry).
+_APP_ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+try:
+    os.chdir(_APP_ROOT)
+except OSError:
+    pass
+if str(_APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_APP_ROOT))
+
+
+def _process_name(pid: int) -> str:
+    """Image file name for ``pid`` (lower-cased), or "" if it cannot be read."""
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        size = wintypes.DWORD(len(buf))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return buf.value.rsplit("\\", 1)[-1].lower()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _owns_console_window() -> bool:
+    """True when this process owns a console window of its own.
+
+    ``python.exe`` opens a console *window* on double-click, whereas an
+    interpreter started from a terminal (``cmd``/PowerShell ``python main.py``,
+    with or without ``>log``) shares that terminal's console, and a
+    ``pythonw.exe`` process, a frozen ``--noconsole`` build and a service-style
+    run have no console at all.
+
+    Distinguishing the first case from the second: look at who else is attached
+    to the console. Only our own interpreter stack (the venv ``python.exe``
+    redirector plus the base interpreter) means we created it; any foreign
+    process — most importantly a shell — means it is the user's terminal and
+    killing it would close their window.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        if not kernel32.GetConsoleWindow():
+            return False
+        attached = (ctypes.c_uint * 16)()
+        count = kernel32.GetConsoleProcessList(attached, 16)
+        if count == 0:
+            return False
+        me = os.getpid()
+        others = [p for p in attached[:count] if p and p != me]
+        return all(_process_name(p) in ("python.exe", "pythonw.exe") for p in others)
+    except Exception:
+        return False
+
+
+def _relaunch_console_free() -> bool:
+    """Detach from an owned console by re-spawning under pythonw.exe.
+
+    Running ``python main.py`` leaves a console window in the taskbar; a
+    background service has none. Returns True when the parent should exit.
+    Disabled by ``GHOSTPILOT_NO_RELAUNCH=1`` and in frozen builds (already
+    windowed).
+    """
+    if not _owns_console_window():
+        return False
+    if os.environ.get("GHOSTPILOT_NO_RELAUNCH") == "1":
+        return False
+    pythonw = Path(sys.executable).resolve().with_name("pythonw.exe")
+    if not pythonw.exists():
+        return False
+    try:
+        import subprocess
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            [str(pythonw), str(_APP_ROOT / "main.py"), *sys.argv[1:]],
+            cwd=str(_APP_ROOT),
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Console-free relaunch failed: {e}")
+        return False
+    return True
+
 
 from src.windows_api import set_dpi_awareness
 from src.asr_client import ASRClient
@@ -10,6 +115,8 @@ from src.llm_engine import LLMEngine
 from src.hotkey_manager import HotkeyManager
 from src.config import config
 from src import crash_logger
+from src import startup_mode
+from src import ollama_boot
 
 
 def _make_asr_client():
@@ -54,7 +161,12 @@ except Exception as e:
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# Windowed/background runs (pythonw, PyInstaller --noconsole) have no stderr:
+# install no console handler, keep INFO flowing to the rotating crash log.
+if sys.stderr is None:
+    logging.getLogger().setLevel(logging.INFO)
+else:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 # Reduce noise from dependency loggers (keep app logs readable)
 for name in (
     "httpx",
@@ -70,8 +182,8 @@ logger = logging.getLogger(__name__)
 async def ui_updater(ui, ui_queue: asyncio.Queue):
     """Consumes the UI queue and updates the PyQt window."""
     # Per-task running buffer of the in-progress answer (Phase 5.4+).
-    # Reset on 'clear', flushed to the session recorder on 'usage' or
-    # 'latency' (the terminal events for text / vision pipelines).
+    # Reset on 'clear'; flushed to the session recorder on the terminal
+    # 'usage' event so the recorded answer matches the visible one.
     answer_buf: list[str] = []
     while True:
         try:
@@ -82,12 +194,24 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
             elif msg["type"] == "clear":
                 ui.update_text("", append=False)
                 answer_buf.clear()
+            elif msg["type"] == "status":
+                # Transient progress (e.g. local OCR recognizing the screenshot).
+                ui.set_status(msg.get("text", ""))
+            elif msg["type"] == "answer_start":
+                # OCR produced the question for the screenshot pipeline: show it
+                # as a Q block, then stream the answer into that same block.
+                speaker = "OCR"
+                ui.append_block(f"[{speaker}] {msg.get('question', '')}\nA: ")
+                ui.show_thinking(msg.get("q_type", ""))
+                ui.set_status("")
+                answer_buf.clear()
             elif msg["type"] == "info":
-                # Observability strip (provider · rag:N)
+                # Observability strip (provider · rag:N · algo:Nc)
                 try:
                     ui.set_info_footer(
                         provider=msg.get("provider", ""),
                         rag_hits=msg.get("rag_hits"),
+                        algo_chars=msg.get("algo_chars", 0),
                     )
                 except Exception:
                     pass
@@ -113,46 +237,47 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
                     answer_buf.clear()
                 except Exception:
                     pass
-            elif msg["type"] == "latency":
-                # Vision pipeline emits latency separately (no token-usage event).
-                try:
-                    total_ms = int(msg.get("total_ms") or 0)
-                    if total_ms > 0:
-                        ui.set_usage_footer(f"{total_ms}ms")
-                    # Capture the vision answer text for replay too.
-                    from src.session_recorder import recorder as _rec
-                    if answer_buf:
-                        _rec.log_llm("assistant", "".join(answer_buf),
-                                     model=msg.get("model", ""))
-                    answer_buf.clear()
-                except Exception:
-                    pass
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"UI Updater Error: {e}")
 
 
-async def run_pipelines(app, loop):
-    """Main async task: wires all modules together inside the qasync loop."""
+async def run_pipelines(app, loop, overlay_mode: str):
+    """Main async task: wires all modules together inside the qasync loop.
+
+    ``overlay_mode`` (see :mod:`src.startup_mode`) decides which overlays exist
+    for this launch: ``both`` / ``vision`` / ``asr``. In ``vision`` mode the
+    audio capture device, the ASR client and the transcript router are never
+    started — the screenshot/OCR pipeline is fully independent.
+    """
     # Import Qt-dependent modules only after Qt is confirmed importable.
-    from src.settings_ui import apply_saved_config
+    # (`apply_saved_config` already ran in main(), before mode resolution.)
     from src.overlay_ui import OverlayUI
     from src.area_capture import AreaCapture
-    apply_saved_config()
+
+    enable_asr, enable_vision = startup_mode.pipeline_flags(overlay_mode)
+    logger.info("Launching pipelines — overlay mode=%s (asr=%s, vision=%s)",
+                overlay_mode, enable_asr, enable_vision)
 
     # ── Initialize modules ────────────────────────────────────────────────
     ui_asr = None
     ui_vision = None
 
-    audio_capture = make_audio_capture(sample_rate=config.SAMPLE_RATE, chunk_size=config.CHUNK_SIZE) if AUDIO_AVAILABLE else None
-    if not AUDIO_AVAILABLE:
+    audio_capture = (
+        make_audio_capture(sample_rate=config.SAMPLE_RATE, chunk_size=config.CHUNK_SIZE)
+        if (AUDIO_AVAILABLE and enable_asr)
+        else None
+    )
+    if enable_asr and not AUDIO_AVAILABLE:
         logger.warning(
             "Audio capture unavailable on this platform (%s). "
             "ASR/audio pipeline is disabled; UI and Vision still work. Reason: %s",
             sys.platform, _AUDIO_IMPORT_ERROR,
         )
-    asr_client = _make_asr_client()
+    elif not enable_asr:
+        logger.info("Vision-only launch: audio capture and ASR service are disabled.")
+    asr_client = _make_asr_client() if enable_asr else None
     rag_manager = RAGManager()
     # ── Load local knowledge base into RAG (resume / cheatsheets / notes) ──
     def _kb_params() -> dict:
@@ -197,8 +322,9 @@ async def run_pipelines(app, loop):
     # ── Start audio → ASR pipeline ────────────────────────────────────────
     # Set event loop before start() so the pyaudio callback thread can call
     # loop.call_soon_threadsafe() safely.
-    audio_capture.set_event_loop(loop)
-    audio_capture.start(audio_queue, device_name_contains=getattr(config, "AUDIO_DEVICE_CONTAINS", ""))
+    if audio_capture is not None:
+        audio_capture.set_event_loop(loop)
+        audio_capture.start(audio_queue, device_name_contains=getattr(config, "AUDIO_DEVICE_CONTAINS", ""))
 
     async def audio_watchdog():
         """Restart loopback capture if callbacks stall (device hotplug / driver hiccup)."""
@@ -216,11 +342,12 @@ async def run_pipelines(app, loop):
             except Exception as e:
                 logger.warning(f"Audio watchdog error: {e}")
 
-    audio_watchdog_task = loop.create_task(audio_watchdog())
+    audio_watchdog_task = loop.create_task(audio_watchdog()) if audio_capture is not None else None
 
     asr_task = None
     ui_task_asr = None
     ui_task_vision = None
+    router_task = None
 
     hk_screenshot = None
     hk_interactions = []
@@ -236,6 +363,9 @@ async def run_pipelines(app, loop):
 
     def _restart_asr():
         nonlocal asr_task, asr_client
+        if asr_client is None:
+            # Vision-only launch: there is no ASR client to restart.
+            return
         try:
             asr_client.stop()
         except Exception:
@@ -347,30 +477,59 @@ async def run_pipelines(app, loop):
 
         loop.create_task(_run())
 
-    ui_asr = OverlayUI(
-        title="GhostPilot · ASR",
-        with_tray=True,
-        start_y=20,
-        accent="ASR",
-        on_settings_saved=on_settings_saved,
-        max_conversation_blocks=getattr(config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3),
-        on_stop=lambda: llm_engine.cancel("text"),
-        on_clear=llm_engine.clear_history,
-        on_rebuild_kb=rebuild_kb,
-        on_replay_session=_start_replay,
-    )
-    ui_vision = OverlayUI(
-        title="GhostPilot · Vision",
-        with_tray=False,
-        start_y=310,
-        accent="Vision",
-        on_settings_saved=on_settings_saved,
-        on_stop=lambda: llm_engine.cancel("vision"),
-    )
+    if enable_asr:
+        ui_asr = OverlayUI(
+            title="GhostPilot · ASR",
+            with_tray=True,
+            start_y=20,
+            accent="ASR",
+            on_settings_saved=on_settings_saved,
+            max_conversation_blocks=getattr(config, "ASR_OVERLAY_MAX_CONVERSATIONS", 3),
+            on_stop=lambda: llm_engine.cancel("text"),
+            on_clear=llm_engine.clear_history,
+            on_rebuild_kb=rebuild_kb,
+            on_replay_session=_start_replay,
+        )
+    if enable_vision:
+        # The ASR overlay owns the tray when both are up; in vision-only mode
+        # the Vision overlay takes over so tray menu / Settings stay reachable.
+        ui_vision = OverlayUI(
+            title="GhostPilot · Vision",
+            with_tray=not enable_asr,
+            start_y=310 if enable_asr else 20,
+            accent="Vision",
+            on_settings_saved=on_settings_saved,
+            on_stop=lambda: llm_engine.cancel("vision"),
+            on_rebuild_kb=rebuild_kb,
+            on_replay_session=_start_replay,
+        )
+
+        async def _warm_ocr_backend():
+            """Bring a local Ollama up, and load the OCR model, before the first
+            screenshot needs either.
+
+            Ollama is normally already running (its installer registers a
+            Startup-folder shortcut), so this is usually an instant probe. When
+            it is not — quit, crashed, autostart disabled, or we launched before
+            it finished booting — starting it now beats discovering that on the
+            hotkey; preloading likewise moves the model load off the first
+            screenshot instead of onto it mid-interview.
+            """
+            try:
+                if await ollama_boot.ensure_available_for_config():
+                    await llm_engine.ocr.preload()
+            except Exception as e:  # noqa: BLE001 — warming is best-effort
+                logger.info("OCR backend warm-up skipped: %s", e)
+
+        loop.create_task(_warm_ocr_backend())
+
     # Start UI updaters and ASR now that UIs exist
-    asr_task = loop.create_task(asr_client.start_streaming(audio_queue, text_queue, loop))
-    ui_task_asr = loop.create_task(ui_updater(ui_asr, ui_queue_asr))
-    ui_task_vision = loop.create_task(ui_updater(ui_vision, ui_queue_vision))
+    if enable_asr and asr_client is not None:
+        asr_task = loop.create_task(asr_client.start_streaming(audio_queue, text_queue, loop))
+        if ui_asr is not None:
+            ui_task_asr = loop.create_task(ui_updater(ui_asr, ui_queue_asr))
+    if ui_vision is not None:
+        ui_task_vision = loop.create_task(ui_updater(ui_vision, ui_queue_vision))
 
     # ── KB watcher: rebuild RAG when knowledge/ files change ──
     # Prefers QFileSystemWatcher (event-driven, ~zero latency) and falls back
@@ -467,14 +626,17 @@ async def run_pipelines(app, loop):
     if not _install_kb_watcher():
         loop.create_task(_kb_poll_loop())
 
-    # ── Hotkey: Alt+P — area-select screenshot → Vision LLM ──────────────
+    # ── Hotkey: Alt+P — area-select screenshot → local OCR → text LLM ────
     async def on_screenshot():
-        logger.info("Alt+P triggered — launching area capture overlay.")
+        if ui_vision is None:
+            logger.warning("Screenshot hotkey pressed but this launch has no Vision overlay (mode=%s).", overlay_mode)
+            return
+        logger.info("Area screenshot hotkey triggered — launching area capture overlay.")
         # Make the overlay show activity immediately.
         try:
             ui_vision.show_thinking("vision")
             await ui_queue_vision.put({"type": "clear"})
-            await ui_queue_vision.put({"type": "token", "text": "📸 识图中…\n"})
+            await ui_queue_vision.put({"type": "status", "text": "📸 识图中… (GLM-OCR)"})
         except Exception:
             pass
         try:
@@ -482,50 +644,82 @@ async def run_pipelines(app, loop):
             if image_bytes is None:
                 logger.info("Screenshot capture cancelled by user.")
                 return
-            # Persist the screenshot to the active session (best-effort).
-            try:
-                from src.session_recorder import recorder as _rec
-                _rec.log_screenshot(image_bytes)
-            except Exception:
-                pass
             ui_vision.set_streaming(True)
             try:
-                await asyncio.wait_for(
-                    llm_engine.generate_vision_answer_stream(image_bytes, ui_queue_vision),
-                    timeout=getattr(config, "VISION_TIMEOUT_SEC", 8.0),
-                )
+                # OCR runs on CPU and the answer streams afterwards; only the
+                # recognition pass is bounded by OCR_TIMEOUT_SEC.
+                await llm_engine.generate_vision_answer_stream(image_bytes, ui_queue_vision)
             finally:
                 ui_vision.set_streaming(False)
+                ui_vision.set_status("")
         except asyncio.CancelledError:
-            logger.info("Vision stream cancelled by user.")
+            logger.info("Screenshot pipeline cancelled by user.")
         except Exception as e:
             logger.error(f"Screenshot pipeline error: {e}")
-            await ui_queue_vision.put({"type": "token", "text": f"\n[⚠️ Vision Error: {e}]"})
+            await ui_queue_vision.put({"type": "token", "text": f"\n[⚠️ Error: {e}]"})
 
     # ── Hotkey: Alt+A — toggle click-through / interactive mode ──────────
     def on_toggle_vision_interaction():
+        if ui_vision is None:
+            return
         logger.info("Vision interaction hotkey triggered.")
         ui_vision.toggle_interaction()
 
+    async def on_screenshot_full():
+        if ui_vision is None:
+            logger.warning("Full-screen hotkey pressed but this launch has no Vision overlay (mode=%s).", overlay_mode)
+            return
+        logger.info("Full-screen screenshot hotkey triggered — capturing primary monitor.")
+        try:
+            ui_vision.show_thinking("vision")
+            await ui_queue_vision.put({"type": "clear"})
+            await ui_queue_vision.put({"type": "status", "text": "📸 全屏截屏，识图中… (GLM-OCR)"})
+        except Exception:
+            pass
+        try:
+            # capture_full_screen is synchronous; run in thread to avoid blocking loop
+            image_bytes = await asyncio.to_thread(AreaCapture.capture_full_screen)
+            if image_bytes is None:
+                logger.info("Full-screen capture returned no data.")
+                return
+            ui_vision.set_streaming(True)
+            try:
+                await llm_engine.generate_vision_answer_stream(image_bytes, ui_queue_vision)
+            finally:
+                ui_vision.set_streaming(False)
+                ui_vision.set_status("")
+        except asyncio.CancelledError:
+            logger.info("Full-screen pipeline cancelled by user.")
+        except Exception as e:
+            logger.error(f"Full-screen screenshot pipeline error: {e}")
+            await ui_queue_vision.put({"type": "token", "text": f"\n[⚠️ Error: {e}]"})
+
+    def _overlays() -> list:
+        return [o for o in (ui_asr, ui_vision) if o is not None]
+
     def on_toggle_both_overlays_interaction():
         """
-        ASR_INTERACTION_HOTKEY / INTERACTION_HOTKEY: move both overlays in sync.
-        Uses set_interaction so one key always yields one net state (avoids
-        double-toggle bugs when the same combo was registered twice).
+        ASR_INTERACTION_HOTKEY / INTERACTION_HOTKEY: move every live overlay in
+        sync. Uses set_interaction so one key always yields one net state (avoids
+        double-toggle bugs when the same combo was registered twice). Degrades
+        gracefully to a single overlay in vision-only / ASR-only mode.
         """
-        all_interactive = ui_asr.is_interactive and ui_vision.is_interactive
-        new_state = not all_interactive
+        overlays = _overlays()
+        if not overlays:
+            return
+        new_state = not all(o.is_interactive for o in overlays)
         logger.info(
-            "Both overlays → %s (draggable / click-through).",
+            "%s overlay(s) → %s (draggable / click-through).",
+            len(overlays),
             "interactive" if new_state else "click-through",
         )
-        ui_asr.set_interaction(new_state)
-        ui_vision.set_interaction(new_state)
+        for o in overlays:
+            o.set_interaction(new_state)
 
     def on_force_stealth():
-        logger.info("Force stealth hotkey triggered (click-through for both overlays).")
-        ui_asr.set_interaction(False)
-        ui_vision.set_interaction(False)
+        logger.info("Force stealth hotkey triggered (click-through for live overlays).")
+        for o in _overlays():
+            o.set_interaction(False)
 
     def _start_hotkey_pair(
         primary: str,
@@ -597,11 +791,30 @@ async def run_pipelines(app, loop):
             f"INTERACTION_HOTKEY(all)={getattr(config, 'INTERACTION_HOTKEY', '')!r}"
         )
 
-        hk_screenshot = HotkeyManager(config.SCREENSHOT_HOTKEY, on_screenshot, loop, suppress=False)
-        hk_screenshot.start()
-        _ss = (config.SCREENSHOT_HOTKEY or "").strip().lower()
-        if _ss:
-            registered_hotkeys.add(_ss)
+        # Screenshot hotkeys only make sense when the Vision overlay exists.
+        if not enable_vision:
+            logger.info("Screenshot hotkeys skipped (no Vision overlay in this launch).")
+
+        # Area screenshot hotkey
+        if enable_vision:
+            hk_screenshot = HotkeyManager(config.SCREENSHOT_HOTKEY, on_screenshot, loop, suppress=False)
+            hk_screenshot.start()
+            _ss = (config.SCREENSHOT_HOTKEY or "").strip().lower()
+            if _ss:
+                registered_hotkeys.add(_ss)
+
+        # Full-screen screenshot hotkey (separate binding)
+        full_combo = (getattr(config, "SCREENSHOT_FULL_HOTKEY", "") or "").strip() if enable_vision else ""
+        if full_combo:
+            key = full_combo.lower()
+            if key in registered_hotkeys:
+                logger.warning("Skipping duplicate full-screen hotkey %r — already bound", full_combo)
+            else:
+                registered_hotkeys.add(key)
+                hk_full = HotkeyManager(full_combo, on_screenshot_full, loop, suppress=False)
+                hk_full.start()
+                # Keep a reference so it can be stopped on shutdown
+                hk_interactions.append(hk_full)
 
         # ASR_INTERACTION_* defaults (alt+a): toggles both overlays together (draggable ↔ click-through).
         hk_interactions += _start_hotkey_pair(
@@ -611,13 +824,15 @@ async def run_pipelines(app, loop):
             label="Both overlays (ASR_INTERACTION_HOTKEY)",
             registered=registered_hotkeys,
         )
-        hk_interactions += _start_hotkey_pair(
-            getattr(config, "VISION_INTERACTION_HOTKEY", ""),
-            getattr(config, "VISION_INTERACTION_HOTKEY_BACKUP", ""),
-            on_toggle_vision_interaction,
-            label="Vision interaction",
-            registered=registered_hotkeys,
-        )
+        # Bound to the Vision overlay only — nothing to toggle without it.
+        if enable_vision:
+            hk_interactions += _start_hotkey_pair(
+                getattr(config, "VISION_INTERACTION_HOTKEY", ""),
+                getattr(config, "VISION_INTERACTION_HOTKEY_BACKUP", ""),
+                on_toggle_vision_interaction,
+                label="Vision interaction",
+                registered=registered_hotkeys,
+            )
 
         # Optional second binding same as ASR_INTERACTION_* (leave empty to avoid duplicate).
         hk_interactions += _start_hotkey_pair(
@@ -727,14 +942,22 @@ async def run_pipelines(app, loop):
             except Exception as e:
                 logger.error(f"ASR Router Error: {e}")
 
-    router_task = loop.create_task(asr_router())
+    if enable_asr:
+        router_task = loop.create_task(asr_router())
 
-    logger.info(
-        "GhostPilot is running.\n"
-        "  Alt+P  → Area screenshot → Vision LLM\n"
-        "  Alt+A  → Toggle interaction / stealth mode\n"
-        "  Right-click tray icon → Settings / Quit"
-    )
+    lines = [f"GhostPilot is running (overlay mode={overlay_mode})."]
+    if enable_vision:
+        lines += [
+            f"  {config.SCREENSHOT_HOTKEY}  → Area screenshot → GLM-OCR → text LLM",
+            f"  {getattr(config, 'SCREENSHOT_FULL_HOTKEY', '') or '(unset)'}"
+            "  → Full-screen screenshot → GLM-OCR → text LLM",
+        ]
+    if enable_asr:
+        lines.append("  WASAPI loopback → ASR → text LLM")
+    lines += [
+        "  Right-click tray icon → Settings / Quit",
+    ]
+    logger.info("\n".join(lines))
 
     try:
         # Suspend here; the qasync loop keeps Qt + asyncio alive
@@ -745,22 +968,29 @@ async def run_pipelines(app, loop):
         logger.info("Shutting down pipelines...")
         if audio_capture is not None:
             audio_capture.stop()
-        asr_client.stop()
+        if asr_client is not None:
+            asr_client.stop()
         if hk_screenshot:
             hk_screenshot.stop()
         for hk in hk_interactions:
             hk.stop()
-        asr_task.cancel()
-        ui_task_asr.cancel()
-        ui_task_vision.cancel()
-        router_task.cancel()
-        audio_watchdog_task.cancel()
+        for task in (asr_task, ui_task_asr, ui_task_vision, router_task, audio_watchdog_task):
+            if task is not None:
+                task.cancel()
 
 
 def main():
+    # Tray-only app: drop the inherited console by re-spawning under pythonw.exe
+    # (source runs only; frozen builds are already windowed).
+    if _relaunch_console_free():
+        logger.info("Relaunched detached under pythonw.exe; exiting the console process.")
+        return
+
     set_dpi_awareness()
 
-    log_path = crash_logger.install()
+    log_path = crash_logger.install(
+        level=logging.INFO if sys.stderr is None else logging.WARNING
+    )
     if log_path:
         logger.info(f"Crash log: {log_path}")
 
@@ -778,6 +1008,28 @@ def main():
     app = QApplication(sys.argv)
     # Keep the process alive when all visible windows are closed (tray-only mode)
     app.setQuitOnLastWindowClosed(False)
+    # Dialog / window icon (Settings, area-capture overlay); the tray icon is
+    # set separately in OverlayUI._init_tray.
+    from src import icons as _icons
+    _app_icon = _icons.app_icon()
+    if not _app_icon.isNull():
+        app.setWindowIcon(_app_icon)
+
+    # config.json (written by Settings, and by the chooser's "remember" box)
+    # must be applied *before* the launch mode is resolved — otherwise
+    # STARTUP_OVERLAY_MODE saved there would be invisible and the chooser would
+    # reappear on every launch.
+    from src.settings_ui import apply_saved_config
+    apply_saved_config()
+
+    # Which overlay(s) to run this launch: --overlay > config > ask (chooser).
+    overlay_mode = startup_mode.resolve_mode()
+    if overlay_mode == startup_mode.MODE_ASK:
+        overlay_mode = startup_mode.choose_overlay_mode()
+        if overlay_mode is None:
+            logger.info("Overlay chooser dismissed — exiting.")
+            return
+    logger.info("Overlay mode: %s", overlay_mode)
 
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
@@ -801,7 +1053,7 @@ def main():
 
         app.aboutToQuit.connect(_on_about_to_quit)
 
-        pipelines_task = loop.create_task(run_pipelines(app, loop))
+        pipelines_task = loop.create_task(run_pipelines(app, loop, overlay_mode))
 
         def _pipelines_done(t: asyncio.Task):
             try:

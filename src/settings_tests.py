@@ -95,7 +95,7 @@ def test_openai(params):
 def test_deepseek(params):
     return _test_openai_compat(
         params, base_url="https://api.deepseek.com/v1",
-        key_field="DEEPSEEK_API_KEY", model_field="TEXT_MODEL", default_model="deepseek-chat",
+        key_field="DEEPSEEK_API_KEY", model_field="TEXT_MODEL", default_model="deepseek-flash",
     )
 
 
@@ -104,7 +104,7 @@ def test_gemini(params):
     key = params.get("GEMINI_API_KEY", "").strip()
     if not key:
         return False, "no key"
-    model = (params.get("VISION_MODEL", "") or "gemini-1.5-flash").strip() or "gemini-1.5-flash"
+    model = (params.get("TEXT_MODEL", "") or "gemini-2.0-flash").strip() or "gemini-2.0-flash"
     try:
         from google import genai
         from google.genai import types
@@ -168,6 +168,7 @@ _PROVIDERS = {
     "gemini": test_gemini,
     "azure": test_azure,
     "ollama": None,  # filled below
+    "ocr": None,  # filled below
 }
 
 
@@ -189,4 +190,29 @@ def test_ollama(params):
         return False, f"{type(e).__name__}: {str(e)[:80]}"
 
 
+@_timed
+def test_ocr(params):
+    """Screenshot OCR: Ollama must be reachable *and* have the OCR model pulled.
+
+    Deliberately tag-only — a real recognition pass takes seconds to minutes on
+    CPU and the Settings dialog must stay responsive.
+    """
+    base = (params.get("OLLAMA_BASE_URL") or "http://localhost:11434/v1").rstrip("/")
+    root = base[:-3].rstrip("/") if base.endswith("/v1") else base
+    model = (params.get("OCR_MODEL") or "glm-ocr-optimized").strip() or "glm-ocr-optimized"
+    import urllib.request
+    import json as _json
+    try:
+        with urllib.request.urlopen(f"{root}/api/tags", timeout=3) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        return False, f"Ollama unreachable at {root}: {type(e).__name__}: {str(e)[:60]}"
+    names = [str(m.get("name") or "") for m in data.get("models", [])]
+    # Ollama reports "glm-ocr-optimized:latest" for an untagged create/pull.
+    if any(n == model or n.split(":")[0] == model for n in names):
+        return True, f"{model} ready"
+    return False, f"{model} not pulled — run: ollama pull glm-ocr && python setup_glm_ocr.py"
+
+
 _PROVIDERS["ollama"] = test_ollama
+_PROVIDERS["ocr"] = test_ocr

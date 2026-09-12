@@ -10,6 +10,17 @@ import pytest
 from src.rag_manager import RAGManager
 
 
+@pytest.fixture(autouse=True)
+def _no_dense_probe(monkeypatch):
+    """Keep these tests off the sentence-transformers import path.
+
+    `load_documents` kicks the dense load off on a background thread; with a
+    broken torch in the venv that thread would spend ~10s failing for every
+    test here. HAS_ST=False short-circuits the probe without touching BM25.
+    """
+    monkeypatch.setattr("src.rag_manager.HAS_ST", False)
+
+
 @pytest.fixture
 def kb_dir(tmp_path: Path) -> Path:
     d = tmp_path / "knowledge"

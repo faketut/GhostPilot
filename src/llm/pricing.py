@@ -9,9 +9,11 @@ _PRICING: dict[str, tuple[float, float]] = {
     "gpt-4o":           (0.0025, 0.010),
     "gpt-4o-mini":      (0.00015, 0.0006),
     "gpt-4-turbo":      (0.010, 0.030),
-    # DeepSeek
-    "deepseek-chat":     (0.00027, 0.0011),
-    "deepseek-reasoner": (0.00055, 0.00219),
+    # DeepSeek (V4 series; deepseek-chat/reasoner were retired July 2026).
+    # Off-peak rates; peak is 2x. https://api-docs.deepseek.com/quick_start/pricing/
+    "deepseek-flash":    (0.00015, 0.0006),
+    "deepseek-v4-flash": (0.00015, 0.0006),
+    "deepseek-v4-pro":   (0.00066, 0.00198),
     # Gemini
     "gemini-1.5-flash":  (0.000075, 0.0003),
     "gemini-1.5-pro":    (0.00125, 0.005),

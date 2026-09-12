@@ -74,15 +74,6 @@ def _collect(provider, **kwargs):
 
 # ── Tests ────────────────────────────────────────────────────────────────
 
-def test_b64_image_url_data_uri():
-    url = oc.OpenAICompatProvider.b64_image_url(b"abc", mime="image/png")
-    assert url.startswith("data:image/png;base64,")
-    # Decodes back to original bytes.
-    import base64
-    payload = url.split(",", 1)[1]
-    assert base64.b64decode(payload) == b"abc"
-
-
 def test_chat_stream_yields_text_deltas_and_usage(monkeypatch):
     p = oc.OpenAICompatProvider(api_key="k", label="openai")
     chunks = [
@@ -158,20 +149,3 @@ def test_openai_base_url_enables_include_usage():
     kwargs = p._client.chat.completions.last_kwargs
     assert kwargs is not None
     assert kwargs.get("stream_options") == {"include_usage": True}
-
-
-def test_vision_stream_delegates_to_chat_stream():
-    p = oc.OpenAICompatProvider(api_key="k", label="openai")
-    p._client = _FakeClient([_delta_chunk("answer")])
-
-    async def run():
-        out = []
-        async for d in p.vision_stream(
-            [{"role": "user", "content": [{"type": "text", "text": "describe"}]}],
-            model="gpt-4o", system_prompt="be brief",
-        ):
-            out.append(d)
-        return out
-
-    out = asyncio.run(run())
-    assert "".join(d.text for d in out) == "answer"
