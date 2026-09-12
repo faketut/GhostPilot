@@ -13,6 +13,8 @@ A glassmorphism-style, frameless, transparent overlay window that:
   - Optional Windows 11 Mica/Acrylic backdrop (silent no-op elsewhere)
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re

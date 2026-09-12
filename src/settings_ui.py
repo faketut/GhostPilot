@@ -6,6 +6,8 @@ config.json and hot-patches the in-memory `config` so most changes apply
 without a restart.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys

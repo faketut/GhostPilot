@@ -1,6 +1,8 @@
 # ruff: noqa: E402 — the bootstrap block below must execute before the src.*
 # imports: src.config resolves .env / config.json relative to the working
 # directory, which is not the app root for a login (autostart) launch.
+from __future__ import annotations
+
 import sys
 import logging
 import asyncio

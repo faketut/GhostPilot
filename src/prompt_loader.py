@@ -15,6 +15,8 @@ recognized text is classified into one of the three types above.
 If a file is missing, a sensible inline fallback is used so the app never crashes.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import sys
