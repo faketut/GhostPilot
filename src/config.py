@@ -214,6 +214,19 @@ class Config:
     # silently losing the answer when the trace runs long.
     ANSWER_MAX_TOKENS = _env_int("ANSWER_MAX_TOKENS", 0)
 
+    # Session-recording retention (recording is opt-in, from the tray menu).
+    # A finished recording is written to ~/Documents/GhostPilot/recordings/<ts>.zip
+    # and nothing used to remove one, so they accumulated forever. Two
+    # independent caps are applied oldest-first on every completed recording;
+    # 0 disables either. The recording just written is always kept.
+    #
+    # Recordings are small text (transcript.jsonl + llm.jsonl) plus the
+    # screenshots taken while recording, so a session runs tens of MB; the
+    # count cap is the one that matters, and the size cap is a backstop for
+    # screenshot-heavy sessions.
+    RECORDING_KEEP_LAST = _env_int("RECORDING_KEEP_LAST", 10)
+    RECORDING_MAX_TOTAL_MB = _env_int("RECORDING_MAX_TOTAL_MB", 2048)
+
     # UI Settings
     # 0.0~1.0, higher = more opaque (less transparent)
     OVERLAY_OPACITY = 0.78

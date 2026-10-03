@@ -34,6 +34,113 @@ def _redact(d: dict) -> dict:
     return {k: ("***" if k in _SECRET_NAMES else v) for k, v in d.items()}
 
 
+# ── Retention ─────────────────────────────────────────────────────────────
+#
+# Recordings accumulate otherwise: `stop` writes a `.zip` and nothing ever
+# removes one. Two independent caps, applied in a single oldest-first pass and
+# both disabled by 0:
+#
+#   RECORDING_KEEP_LAST     how many recordings to keep
+#   RECORDING_MAX_TOTAL_MB  how much disk they may occupy in total
+#
+# Only entries directly inside the recordings root are considered, so files a
+# user keeps elsewhere are never touched, and the recording just written is
+# never a candidate — deleting the session the user just stopped would be the
+# one unacceptable failure here.
+
+
+def _recording_entries() -> list[Path]:
+    """Recordings under the root, newest first.
+
+    Both shapes count: the `.zip` a completed recording becomes, and the bare
+    directory left behind when zipping failed.
+    """
+    try:
+        entries = [p for p in _recordings_root().iterdir() if p.is_dir() or p.suffix == ".zip"]
+    except OSError:
+        return []
+    try:
+        entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    return entries
+
+
+def _entry_bytes(path: Path) -> int:
+    """Size of a recording, following a directory when the zip failed."""
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    except OSError:
+        return 0
+
+
+def _remove_recording(path: Path, size: int) -> bool:
+    # `size` is passed in rather than measured here: it has to be read *before*
+    # the removal, or the log line reports 0 MB for every deletion.
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as e:
+        logger.warning("Retention could not remove %s: %s", path, e)
+        return False
+    logger.info("Retention removed %s (%.1f MB)", path.name, size / 1048576)
+    return True
+
+
+def prune_recordings(
+    *, keep_last: int | None = None, max_total_mb: int | None = None,
+    protect: Path | None = None,
+) -> list[Path]:
+    """Apply the retention policy; return the recordings that were removed.
+
+    ``protect`` (the recording just written) is always kept and still counts
+    toward both caps, so ``stop`` cannot delete what it just produced even when
+    that recording alone exceeds the size cap.
+
+    The caps default to ``RECORDING_KEEP_LAST`` / ``RECORDING_MAX_TOTAL_MB``;
+    passing either argument overrides it, which is what keeps this testable
+    without patching global config.
+    """
+    if keep_last is None or max_total_mb is None:
+        from src.config import config
+        if keep_last is None:
+            keep_last = int(getattr(config, "RECORDING_KEEP_LAST", 10) or 0)
+        if max_total_mb is None:
+            max_total_mb = int(getattr(config, "RECORDING_MAX_TOTAL_MB", 2048) or 0)
+
+    if keep_last <= 0 and max_total_mb <= 0:
+        return []                       # both caps disabled
+
+    cap_bytes = max_total_mb * 1024 * 1024
+    removed: list[Path] = []
+    kept = 0
+    used = 0
+
+    for entry in _recording_entries():
+        size = _entry_bytes(entry)
+        is_protected = protect is not None and entry == protect
+        over_count = keep_last > 0 and kept >= keep_last
+        over_size = max_total_mb > 0 and used + size > cap_bytes
+        if not is_protected and (over_count or over_size):
+            if _remove_recording(entry, size):
+                removed.append(entry)
+            continue
+        kept += 1
+        used += size
+
+    if removed:
+        logger.info(
+            "Recording retention: kept %d (%.1f MB), removed %d "
+            "(RECORDING_KEEP_LAST=%d, RECORDING_MAX_TOTAL_MB=%d)",
+            kept, used / 1048576, len(removed), keep_last, max_total_mb,
+        )
+    return removed
+
+
 class SessionRecorder:
     def __init__(self):
         self._lock = Lock()
@@ -97,10 +204,18 @@ class SessionRecorder:
                 zip_path = shutil.make_archive(str(d), "zip", root_dir=d)
                 shutil.rmtree(d, ignore_errors=True)
                 logger.info("Recording saved: %s", zip_path)
-                return Path(zip_path)
+                result = Path(zip_path)
             except Exception as e:
                 logger.warning("Recording zip failed: %s", e)
-                return d
+                result = d
+            # Retention runs here, the one point where a recording is complete:
+            # `stop` is the only place a recording is produced, so this is what
+            # keeps the old ones bounded. The new file is protected.
+            try:
+                prune_recordings(protect=result)
+            except Exception as e:
+                logger.warning("Recording retention failed: %s", e)
+            return result
 
     def _cleanup(self) -> None:
         for f in (self._transcript_f, self._llm_f):

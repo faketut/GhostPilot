@@ -143,3 +143,127 @@ def test_log_user_turn_pairs_with_assistant(isolated_recorder):
 def test_log_user_turn_before_start_is_noop(isolated_recorder):
     isolated_recorder.log_user_turn("orphan", q_type="x")  # must not raise
     assert not isolated_recorder.is_recording()
+
+
+# ── Retention ────────────────────────────────────────────────────────────
+#
+# This is the one place in the recorder that *deletes user data*, so the
+# contracts are pinned rather than assumed: newest kept, the just-written
+# recording never deleted, foreign files untouched, and both caps independently
+# disableable.
+
+
+def _make_recording(root, name: str, *, size: int, mtime: float, as_dir: bool = False):
+    """A recording of `size` bytes named `name`, with a controlled mtime."""
+    import os
+    if as_dir:
+        p = root / name
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "transcript.jsonl").write_bytes(b"x" * size)
+    else:
+        p = root / name
+        p.write_bytes(b"x" * size)
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_retention_keeps_the_newest_n(isolated_recorder, tmp_path):
+    """The count cap, and the order it counts in: newest survives."""
+    paths = [
+        _make_recording(tmp_path, f"2026010{i}-000000.zip", size=10, mtime=1000 + i)
+        for i in range(1, 6)          # 5 recordings, oldest first
+    ]
+    removed = sr.prune_recordings(keep_last=2, max_total_mb=0)
+
+    assert {p.name for p in removed} == {paths[0].name, paths[1].name, paths[2].name}
+    assert paths[3].exists() and paths[4].exists()
+
+
+def test_retention_size_cap_drops_oldest_until_under(isolated_recorder, tmp_path):
+    """1 MB cap over 0.4 MB recordings: the newest two fit, the third does not."""
+    paths = [
+        _make_recording(tmp_path, f"2026010{i}-000000.zip", size=400_000, mtime=1000 + i)
+        for i in range(1, 5)
+    ]
+    sr.prune_recordings(keep_last=0, max_total_mb=1)
+
+    assert not paths[0].exists() and not paths[1].exists()
+    assert paths[2].exists() and paths[3].exists()
+
+
+def test_retention_never_deletes_the_protected_recording(isolated_recorder, tmp_path):
+    """`stop` protects what it just wrote — even when it alone breaks the cap.
+
+    A user who records a long session must not have it deleted the moment it is
+    saved; the older recordings are the ones that go.
+    """
+    old = _make_recording(tmp_path, "20260101-000000.zip", size=100, mtime=1000)
+    new = _make_recording(tmp_path, "20260102-000000.zip", size=5_000_000, mtime=2000)
+
+    removed = sr.prune_recordings(keep_last=1, max_total_mb=1, protect=new)
+
+    assert removed == [old]
+    assert new.exists(), "the recording just written must survive its own size"
+
+
+def test_retention_leaves_non_recording_files_alone(isolated_recorder, tmp_path):
+    """Only `.zip` and directories are candidates; a stray file is not ours."""
+    keep = _make_recording(tmp_path, "20260102-000000.zip", size=10, mtime=2000)
+    old = _make_recording(tmp_path, "20260101-000000.zip", size=10, mtime=1000)
+    notes = tmp_path / "notes.txt"
+    notes.write_text("mine")
+    subdir_notes = tmp_path / "keepme"
+    subdir_notes.mkdir()
+    (subdir_notes / "readme.md").write_text("not a recording")
+
+    sr.prune_recordings(keep_last=1, max_total_mb=0, protect=keep)
+
+    assert not old.exists()
+    assert keep.exists()
+    assert notes.exists(), "a non-recording file must never be deleted"
+
+
+def test_retention_removes_a_leftover_unzipped_directory(isolated_recorder, tmp_path):
+    """A zip that failed leaves the session directory behind — still ours."""
+    keep = _make_recording(tmp_path, "20260102-000000.zip", size=10, mtime=3000)
+    leftover = _make_recording(tmp_path, "20260101-000000", size=10, mtime=1000, as_dir=True)
+
+    sr.prune_recordings(keep_last=1, max_total_mb=0, protect=keep)
+
+    assert not leftover.exists(), "an unzipped session dir is a recording too"
+
+
+def test_retention_with_both_caps_disabled_is_a_noop(isolated_recorder, tmp_path):
+    p = _make_recording(tmp_path, "20260101-000000.zip", size=10, mtime=1000)
+    assert sr.prune_recordings(keep_last=0, max_total_mb=0) == []
+    assert p.exists()
+
+
+def test_stop_applies_retention(isolated_recorder, tmp_path, monkeypatch):
+    """End to end: stopping a recording prunes the old ones by itself.
+
+    This is the contract that matters in practice — nobody calls
+    prune_recordings in normal use, `stop` has to run the policy.
+
+    (Recordings are pre-seeded rather than produced by four start/stop cycles:
+    the session directory is named to the second, so a loop would zip to the
+    same filename each time and overwrite itself.)
+    """
+    from src.config import config
+    monkeypatch.setattr(config, "RECORDING_KEEP_LAST", 2, raising=False)
+    monkeypatch.setattr(config, "RECORDING_MAX_TOTAL_MB", 0, raising=False)
+
+    old = [
+        _make_recording(tmp_path, f"2026010{i}-000000.zip", size=10, mtime=1000 + i)
+        for i in range(1, 4)
+    ]
+    assert len(list(tmp_path.glob("*.zip"))) == 3
+
+    isolated_recorder.start()
+    out = isolated_recorder.stop()
+    assert out is not None and out.exists()
+
+    remaining = sorted(p.name for p in tmp_path.glob("*.zip"))
+    assert len(remaining) == 2, f"retention did not run on stop: {remaining}"
+    assert out.name in remaining, "the recording just written must survive"
+    assert not old[0].exists() and not old[1].exists()

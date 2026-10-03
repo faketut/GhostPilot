@@ -817,6 +817,31 @@ Secret fields all have a show/hide toggle. Most changes apply immediately — no
 - **Export current conversation** from the ASR overlay (writes Markdown to disk).
 - **Session recorder** (opt-in, minimal): when enabled, appends each finalized Q/A to a JSONL file under the user data dir for later review.
 
+### Retention
+
+A finished recording is zipped to
+`~/Documents/GhostPilot/recordings/<ts>.zip` (the working directory is removed
+after zipping), and retention runs automatically at that moment, oldest first:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `RECORDING_KEEP_LAST` | `10` | How many recordings to keep (`0` disables the cap) |
+| `RECORDING_MAX_TOTAL_MB` | `2048` | How much disk they may occupy in total (`0` disables) |
+
+Both caps are applied in one pass over the same oldest-first list, so either can
+be the binding one. The recording just written is **always kept** — it counts
+toward both caps but is never a deletion candidate, so a long session cannot be
+deleted the instant it is saved.
+
+Only `.zip` files and directories directly inside `recordings/` are considered;
+anything else placed there is left alone, and a session directory left behind by
+a failed zip counts as a recording (it is the same session, just unarchived).
+
+Known limit: a session directory is named to the second, so two recordings
+started within the same second zip to the same filename and the first is
+overwritten. Not reachable from the tray menu (start and stop are seconds
+apart), but it would matter to anything scripted.
+
 ## Security
 
 - API keys preferred storage: **OS keyring** (`keyring`). Falls back to `.env` and `config.json` for compatibility.
