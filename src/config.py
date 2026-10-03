@@ -110,24 +110,31 @@ class Config:
 
     # Screenshot OCR runs locally through Ollama (native /api/generate), then
     # the recognized text is answered by the text model above.
-    #   ollama pull glm-ocr && python setup_glm_ocr.py
+    #   ollama pull glm-ocr && pip install gguf && python setup_glm_ocr.py
     OCR_MODEL = os.getenv("OCR_MODEL", "glm-ocr-optimized")
-    # The stock "Text recognition:" prompt makes GLM-OCR continue past the page
-    # and repeat itself (measured: one line emitted 164×, 1984 chars, 59-94 s of
-    # decode for text it had already transcribed). Asking for the text alone and
-    # an explicit stop terminates cleanly on the same image in ~12 s with
-    # identical accuracy. Kept configurable because a provider-prefix style
-    # prompt is still needed if you switch to a model without a GLM renderer.
+    # Recognition prompt sent with every screenshot. Measured head-to-head
+    # against GLM-OCR's native task prompts ("Text Recognition:" and friends),
+    # the wording does *not* decide whether generation terminates — that is the
+    # end-of-generation defect described on OCR_NUM_PREDICT below, and it
+    # reproduces with every prompt tried. The wording does select the output
+    # *format*: the native prompts switch the model to table HTML / LaTeX, so
+    # this states the text task explicitly.
     OCR_PROMPT = os.getenv("OCR_PROMPT", "Transcribe all text in this image. Output only the text.")
-    # Longest edge (px) the screenshot is scaled to before OCR: downscaled above
-    # it (the vision prefill dominates the latency), upscaled below it (the model
-    # reads small text poorly and falls into a repetition loop).
+    # Longest edge (px) the screenshot is scaled to before OCR. Downscale above
+    # it — the vision prefill dominates the latency and scales with the
+    # *downscaled* pixel count (measured: 512px 5.1s, 768px 14.5s, 1024px 23.1s,
+    # 1600px 98.6s for one page). Raising it is a bad trade: 1600px cost 3x the
+    # prefill of 1024px for 20/27 vs 18/27 lines recovered, and a *region*
+    # captured at native density read 24/27 at the 1024px price. Prefer a
+    # tighter region over a bigger dimension; see OCR_MIN_DIMENSION.
     OCR_MAX_DIMENSION = _env_int("OCR_MAX_DIMENSION", 1024)
-    # A small drag-selected region sent at native size (or scaled only to 768) is
-    # unreadable for GLM-OCR, which then loops until the token cap. Normalising
-    # the long edge to the same 1024 keeps it legible; lower this to skip the
-    # upscale and accept that small crops are slower.
-    OCR_MIN_DIMENSION = _env_int("OCR_MIN_DIMENSION", 1024)
+    # Floor for the long edge: 0 disables upscaling. Upscaling a small crop adds
+    # no information, and it was measured to add no accuracy either — a 420px
+    # crop read 13/14 lines sent as-is, at 512px, and at 1024px, while the
+    # prefill went 5.6s -> 7.7s -> 37.7s (tokens scale with the square of the
+    # long edge). Same at 560px: 14/14 either way, 7.0s vs 27.4s. The old
+    # default of 1024 made every drag-selected region ~5x slower for nothing.
+    OCR_MIN_DIMENSION = _env_int("OCR_MIN_DIMENSION", 0)
     # CPU OCR takes seconds to minutes; this bounds one recognition request.
     OCR_TIMEOUT_SEC = _env_float("OCR_TIMEOUT_SEC", 180.0)
     # Wall-clock budget for one recognition. OCR_TIMEOUT_SEC is the httpx *read*
@@ -138,10 +145,24 @@ class Config:
     # 2.2 GB F16 GLM-OCR costs ~30 s on CPU — paid on the next screenshot.
     # keep_alive holds it resident across a normal interview's gap between shots.
     OCR_KEEP_ALIVE = os.getenv("OCR_KEEP_ALIVE", "30m")
-    # Hard cap on tokens generated per screenshot. GLM-OCR is greedy
-    # (temperature 0 / top_k 1): on an image it cannot read it latches onto the
-    # last token group and repeats it until the cap. The model's own num_predict
-    # is 8192 — ~13 measured minutes of CPU for one degenerate screenshot.
+    # Backstop cap on tokens generated per screenshot.
+    #
+    # The failure this bounds has a root cause, and it is *not* the prompt and
+    # not the cap: Ollama's `glm-ocr` GGUF ships without
+    # `tokenizer.ggml.eot_token_id`, so `<|user|>` — the token the model emits
+    # to end its turn — is never an end-of-generation token and generation
+    # cannot stop. GLM-OCR therefore transcribes the page correctly and keeps
+    # going, re-emitting it until a cap; on Ollama >= 0.34.1 the byte-identical
+    # replay also trips llama.cpp's token-repeat guard, which is where the
+    # "repeat token" / limit-exceeded errors come from. Measured on one
+    # synthetic banner: 2000 tokens / 141 s unpatched -> 21 tokens / 7.3 s once
+    # `<|user|>` is registered; a full code page: 2000 -> 334 tokens.
+    #
+    # `setup_glm_ocr.py` applies that repair, so with a normal install
+    # generation stops on its own and this cap is never reached. It stays as a
+    # backstop for a model built without the repair (no `gguf` package, or an
+    # older model), where raising it buys more duplication rather than a better
+    # transcript. `src/ocr_client.py`'s repetition guard covers the rest.
     OCR_NUM_PREDICT = _env_int("OCR_NUM_PREDICT", 1024)
     # Stop consuming a degenerate stream after this many identical trailing lines.
     OCR_REPEAT_GUARD_LINES = _env_int("OCR_REPEAT_GUARD_LINES", 12)

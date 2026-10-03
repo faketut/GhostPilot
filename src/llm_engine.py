@@ -753,8 +753,10 @@ class LLMEngine:
                     f"Question:\n{question}\n\n"
                     f"Your previous answer:\n{draft[:1500]}\n\n"
                     "Reply with exactly ONE fenced code block and nothing else: no tags, no "
-                    "prose, no explanation. Use ```python unless another language is clearly "
-                    "required. The code must be complete and runnable."
+                    "prose, no explanation. Tag it with the language the question uses — its "
+                    "template, stub or signature if one is shown, otherwise the language the "
+                    "statement is written in — and fall back to ```python only when the "
+                    "question names no language at all. The code must be complete and runnable."
                 ),
             },
         ]
@@ -826,16 +828,21 @@ class LLMEngine:
     def _prepare_ocr_image(image_bytes: bytes) -> bytes:
         """Fit a screenshot for OCR and re-encode as JPEG.
 
-        GLM-OCR's accuracy and speed are driven by pixel dimensions. Scaling is
-        bounded in *both* directions:
+        GLM-OCR's accuracy and speed are driven by pixel dimensions, and speed is
+        driven by the *downscaled* count: prefill is roughly linear in image
+        tokens, which scale with the square of the long edge. Measured on one
+        page: 512px 5.1 s, 640px 8.6 s, 768px 14.5 s, 896px 17.3 s, 1024px
+        23.1 s, 1600px 98.6 s.
 
-        * **down** to ``OCR_MAX_DIMENSION`` — the vision prefill is the dominant
-          cost of a full-screen shot (~9 s at 1024 px long edge, ~25 s at
-          900 px on a cropped region).
-        * **up** to ``OCR_MIN_DIMENSION`` — a small drag-selected region sent at
-          its native size (e.g. 500x260) is unreadable for the model, which then
-          latches onto a token group and repeats it; upscaling makes the text
-          legible again and the run terminates on its own.
+        * **down** to ``OCR_MAX_DIMENSION`` — the vision prefill dominates a
+          full-screen shot, so this is the main cost control. Raising it is a
+          poor trade: 1600px cost 3x the prefill of 1024px for 20/27 vs 18/27
+          lines recovered, while a *region* captured at native density read
+          24/27 lines at the 1024px price. Crop tighter instead.
+        * **up** to ``OCR_MIN_DIMENSION`` — disabled by default (0). Upscaling
+          adds no information and measured no accuracy: a 420px crop recovered
+          13/14 lines identically as-is, at 512px and at 1024px, for 5.6 s,
+          7.7 s and 37.7 s respectively.
         """
         img = Image.open(io.BytesIO(image_bytes))
         max_dim = max(256, int(getattr(config, "OCR_MAX_DIMENSION", 1024) or 1024))
@@ -911,17 +918,23 @@ class LLMEngine:
                 removed, 100 * removed / max(1, len(raw)), stop_kind or "n/a",
             )
 
+        # Only a transcript too short to carry the question is reported. Past
+        # `_MIN_TRUSTED_TRANSCRIPT_CHARS` the recognition is treated as complete
+        # whatever the stop reason: the model's dominant failure is reading the
+        # page correctly and then *generating* past it (a replayed page, an
+        # invented block, fence spam), and that continuation is what reaches the
+        # cap or the wall-clock budget. Warning on it was the false alarm this
+        # route hit most — the transcript already held the question.
+        # `trim_repetition` above removes the replay when there is one.
         warning = ""
-        if stop_kind == "loop":
-            # The tail was repetition, not recognition; after trimming there is
-            # nothing left to warn about — unless almost nothing survived.
-            if len(text) < self._MIN_TRUSTED_TRANSCRIPT_CHARS:
+        if note and len(text) < self._MIN_TRUSTED_TRANSCRIPT_CHARS:
+            if stop_kind == "loop":
                 warning = (
                     "OCR stopped after only "
                     f"{len(text)} chars — the screenshot may have been unreadable"
                 )
-        elif note:
-            warning = f"{note}. The text may be missing its ending."
+            else:
+                warning = f"{note}. The text may be missing its ending."
 
         if warning:
             try:

@@ -591,8 +591,13 @@ async def test_non_algorithm_routes_are_never_repaired():
 # page inside a code fence, inventing a code block and re-emitting that, or
 # collapsing into fence spam. Every configuration tested (768/1024/1280/1600 px,
 # PNG/JPEG, dark/inverted/light) did this, and the recognition before the loop
-# was byte-perfect. So the loop is not a recognition failure: it must be stopped
-# early, trimmed off, and *not* reported as an incomplete transcript.
+# was byte-perfect.
+#
+# The cause is now known and fixed in the model, not here: Ollama's glm-ocr GGUF
+# ships without `tokenizer.ggml.eot_token_id`, so the model has no way to end
+# its turn (see setup_glm_ocr.py). What the tests below cover is this module's
+# job for a model built without that repair: stop the stream early, trim the
+# replay off, and only *then* decide what the user should be told.
 
 PAGE = (
     "LeetCode 121. Best Time to Buy and Sell Stock\n"
@@ -832,6 +837,35 @@ async def test_a_cap_stopped_transcript_still_warns():
 
     assert text == partial
     assert "cap" in warning and "missing its ending" in warning
+
+
+@pytest.mark.asyncio
+async def test_a_cap_stop_on_a_full_transcript_is_not_reported():
+    """The false alarm that survives the repetition guard: the model reads the
+    page, *generates* past it, and the runaway — not the recognition — is what
+    reaches the token cap. The transcript is complete, so warning that it is
+    "missing its ending" tells the user to distrust a whole page.
+
+    This is the shape the missing end-of-generation token produces, and the
+    cap is not the fix for it (see setup_glm_ocr.py), so the judgement has to
+    hold even when the cap is genuinely what stopped generation."""
+    complete = PAGE  # a whole page, well past _MIN_TRUSTED_TRANSCRIPT_CHARS
+
+    class _CappedOCR:
+        model = "glm-ocr-optimized"
+
+        async def recognize_stream(self, _image_bytes):
+            yield complete
+            raise OCRTruncated("generation hit the 1024-token cap", kind="cap")
+
+    eng = LLMEngine.__new__(LLMEngine)
+    eng.ocr = _CappedOCR()
+    ui: asyncio.Queue = asyncio.Queue()
+
+    text, warning = await eng._ocr_screenshot(b"\xff\xd8", ui)
+
+    assert text == complete
+    assert warning == "", "a complete transcript must not be reported as truncated"
 
 
 @pytest.mark.asyncio

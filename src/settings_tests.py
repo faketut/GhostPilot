@@ -214,7 +214,7 @@ def test_ocr(params):
     # Ollama reports "glm-ocr-optimized:latest" for an untagged create/pull.
     if any(n == model or n.split(":")[0] == model for n in names):
         return True, f"{model} ready"
-    return False, f"{model} not pulled — run: ollama pull glm-ocr && python setup_glm_ocr.py"
+    return False, f"{model} not pulled — run: ollama pull glm-ocr && pip install gguf && python setup_glm_ocr.py"
 
 
 _PROVIDERS["ollama"] = test_ollama

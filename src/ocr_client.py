@@ -12,16 +12,21 @@ Latency is dominated by two things on CPU, both handled here:
 * **Model load.** Reloading the 2.2 GB F16 GLM-OCR takes ~30 s, and Ollama
   evicts an idle model after 5 minutes by default. ``keep_alive`` keeps it
   resident between screenshots.
-* **A greedy repetition loop.** GLM-OCR runs at temperature 0 / top_k 1. On an
-  image it cannot read it latches onto the last token group and repeats it
-  until the token cap; the model's own cap is 8192, which measured ~13 minutes
-  per screenshot. Bounded three ways: a per-request ``num_predict``, a
+* **A greedy repetition loop.** Ollama's ``glm-ocr`` GGUF ships without
+  ``tokenizer.ggml.eot_token_id``, so ``<|user|>`` — the token the model emits
+  to end its turn — is not an end-of-generation token and generation cannot
+  stop. On an image it cannot read especially, GLM-OCR latches onto the last
+  token group and repeats it until the token cap; the model's own cap is 8192,
+  which measured ~13 minutes per screenshot. The cause is fixed in the model by
+  ``setup_glm_ocr.py`` (see its docstring); this module bounds the damage for a
+  model built without that repair, three ways: a per-request ``num_predict``, a
   wall-clock deadline, and a repetition guard that abandons a degenerate tail.
 
 Setup (see ``setup_glm_ocr.py``)::
 
     ollama pull glm-ocr
-    python setup_glm_ocr.py        # ollama create glm-ocr-optimized
+    pip install gguf
+    python setup_glm_ocr.py        # ollama create glm-ocr-optimized (+ EOG repair)
 """
 
 from __future__ import annotations
@@ -82,7 +87,7 @@ def _error_from_body(status: int, body: str) -> str:
     if status == 404 or "not found" in detail.lower():
         return (
             f"Ollama model missing ({detail or 'not found'}). "
-            "Run: ollama pull glm-ocr && python setup_glm_ocr.py"
+            "Run: ollama pull glm-ocr && pip install gguf && python setup_glm_ocr.py"
         )
     return f"Ollama HTTP {status}: {detail or 'request failed'}"
 

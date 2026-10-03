@@ -1,10 +1,15 @@
 FROM glm-ocr
 
 # Hardware & Context Settings
+# num_thread is a placeholder: setup_glm_ocr.py overwrites it with the machine's
+# logical core count, which measured faster than physical cores on both prefill
+# (18.5s vs 23.2s at 1024px) and decode (23.9 vs 18.7 tok/s) on a 4C/8T CPU.
 PARAMETER num_ctx 16384
-PARAMETER num_thread 6
+PARAMETER num_thread 8
 
 # Your Specific Generation Parameters
+# num_predict is a backstop only. setup_glm_ocr.py registers GLM-OCR's
+# end-of-generation token, so recognition stops by itself in ~200-350 tokens.
 PARAMETER num_predict 8192
 PARAMETER temperature 0
 PARAMETER top_p 0.00001

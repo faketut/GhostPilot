@@ -11,6 +11,10 @@ mss>=9.0.1
 keyboard>=0.13.5
 numpy>=1.26.4
 Pillow>=10.2.0
+# Used by setup_glm_ocr.py to register GLM-OCR's end-of-generation token in the
+# GGUF metadata — without it the OCR model cannot stop and re-emits the page
+# until the token cap (the "repeat token" / limit-exceeded failure).
+gguf>=0.10.0
 onnxruntime>=1.17.1
 sentence-transformers>=2.5.1
 python-dotenv>=1.0.1

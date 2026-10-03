@@ -19,7 +19,7 @@ Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LL
 - **Faster OCR, measured** — the stock `Text recognition:` prompt made GLM-OCR run past the page and repeat itself (one line emitted 164×; 1984 chars of which ~95% was garbage, 59-94s of decode). The prompt now asks for the text alone and an explicit stop: **59s → 12s on the same image with identical accuracy**, backstopped by a repetition guard for pages where the model loops anyway. Model kept resident between screenshots, and the image is normalised to a legible long edge. Shipped steady state is ~10s per screenshot with no runaways; see [measured latency](#measured-latency-i7-1165g7-4c8t-glm-ocr-11b-f16-num_ctx-16384).
 - **Answers are no longer cut off mid-code-block** — the stream was capped at `max_tokens=450`, and **`deepseek-flash` is a reasoning model: its hidden chain-of-thought is billed against that same cap**, so the trace routinely ate the whole budget and the visible answer stopped wherever it had got to — typically right after the code fence's first line, i.e. a function header with no body. Measured: at a cap of 450 *and* at 1200 the reasoning trace consumed 100% of the budget and the visible answer was **empty**. The cap is therefore **removed by default (`ANSWER_MAX_TOKENS=0` = uncapped)**; when a provider does stop early the overlay says so, naming the reasoning share, and the per-turn usage row logs a `reasoning` field. See [answer length](#answer-length-answer_max_tokens-default-0--uncapped).
 - **Local screenshot OCR** — the screenshot route no longer calls a cloud vision model. `SCREENSHOT_HOTKEY` captures a region (or `SCREENSHOT_FULL_HOTKEY` the whole monitor), the image is downscaled and sent to **GLM-OCR running in Ollama on your machine**, and the recognized text is streamed to the **DeepSeek V4** text model exactly like an ASR transcript. No image ever leaves the machine; only the recognized text does.
-- **GLM-OCR setup helper** — `python setup_glm_ocr.py` pulls `glm-ocr`, pins the sampling parameters from `ocr/GLM-Config` (temperature 0, top_k 1, 16k context) and auto-detects your **physical** core count for `num_thread`.
+- **GLM-OCR setup helper** — `pip install gguf && python setup_glm_ocr.py` pulls `glm-ocr`, **registers its missing end-of-generation token** (Ollama's GGUF ships without `tokenizer.ggml.eot_token_id`, so the model literally cannot stop and runs to the token cap — the `repeat token` / limit-exceeded failure; measured 2000 tok/141 s → 21 tok/7.3 s), pins the sampling parameters from `ocr/GLM-Config` (temperature 0, top_k 1, 16k context) and auto-detects your **physical** core count for `num_thread`.
 - **DeepSeek V4 model names** — `TEXT_MODEL` defaults to `deepseek-flash` (V4.1-Flash); `deepseek-chat` was retired upstream in July 2026. Pricing table updated (`deepseek-flash`, `deepseek-v4-flash`, `deepseek-v4-pro`).
 - **Simpler LLM plumbing** — the vision provider abstraction is gone (`VISION_MODEL`, `VISION_PROVIDER`, `VISION_PROVIDER_FALLBACK`, `VISION_HISTORY`, `prompts/vision.md`). One text provider, one OCR client.
 
@@ -206,7 +206,9 @@ All config can be set via:
 
   ```powershell
   ollama pull glm-ocr
+  pip install gguf
   python setup_glm_ocr.py        # creates glm-ocr-optimized (see ocr/GLM-Config)
+                                 # and registers GLM-OCR's end-of-generation token
   ```
 
 ### Local ASR (sherpa-onnx)
@@ -390,19 +392,57 @@ no hint that the fix was "start Ollama".
 | --- | --- | --- |
 | `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama endpoint (shared with the Ollama text provider) |
 | `OLLAMA_AUTOSTART` | `1` | Start a local Ollama at launch if it is not answering |
-| `OCR_MODEL` | `glm-ocr-optimized` | Model created by `setup_glm_ocr.py` |
-| `OCR_PROMPT` | `Transcribe all text in this image. Output only the text.` | Recognition prompt sent with every screenshot |
-| `OCR_MAX_DIMENSION` | `1024` | Longest edge (px) the screenshot is scaled down to |
-| `OCR_MIN_DIMENSION` | `1024` | Longest edge it is scaled **up** to |
+| `OCR_MODEL` | `glm-ocr-optimized` | Model created by `setup_glm_ocr.py` (which also repairs the end-of-generation token — re-run after re-pulling `glm-ocr`) |
+| `OCR_PROMPT` | `Transcribe all text in this image. Output only the text.` | Recognition prompt sent with every screenshot (selects the output task/format, not whether generation stops) |
+| `OCR_MAX_DIMENSION` | `1024` | Longest edge the screenshot is scaled down to — prefill scales with the *downscaled* pixel count, so this is the main cost control |
+| `OCR_MIN_DIMENSION` | `0` | Longest edge it is scaled **up** to; `0` = never upscale (measured to add no accuracy at 5× the cost) |
 | `OCR_TIMEOUT_SEC` | `180.0` | httpx *read* timeout (only fires when the stream stalls) |
 | `OCR_TOTAL_TIMEOUT_SEC` | `120.0` | Wall-clock budget for one recognition |
 | `OCR_KEEP_ALIVE` | `30m` | How long Ollama holds the model resident |
-| `OCR_NUM_PREDICT` | `1024` | Cap on tokens generated per screenshot (a backstop — raising it buys more repetition, not a better transcript) |
+| `OCR_NUM_PREDICT` | `1024` | Backstop cap on tokens per screenshot — never reached once the end-of-generation token is registered; raising it buys more repetition, not a better transcript |
 | `OCR_REPEAT_GUARD_LINES` | `12` | Abandon a stream repeating the same *line* 12× (the replay guard handles the rest) |
 
 Recognition streams token-by-token, so the Vision overlay shows the text as it
 is recognized (`OCR · …` in the status line) before the answer starts streaming.
 Failures are reported in the overlay only — the ASR pipeline is unaffected.
+
+#### The real cause: GLM-OCR ships without an end-of-generation token
+
+Ollama's `glm-ocr` GGUF has no `tokenizer.ggml.eot_token_id`. `<|user|>` — the
+token the model emits to end its turn — is therefore not an end-of-generation
+token, and the model **cannot stop**. It transcribes the screenshot correctly
+and then keeps going, re-emitting the page until something else ends the
+request. On Ollama ≥ 0.34.1 the byte-identical replay also trips llama.cpp's
+token-repeat guard, which is where users see `repeat token` / limit-exceeded
+errors; on 0.35.0 the replay is fence-wrapped instead, so it survives as 2000
+tokens of duplicated transcript.
+
+Verified on this machine (Ollama 0.35.0, `glm-ocr` F16, CPU), one synthetic
+banner and one full code page:
+
+| | unpatched | after registering `<|user|>` as EOG |
+| --- | --- | --- |
+| dense text page | 2000 tok / 152 s, page re-emitted | **334 tok / 70 s**, clean |
+| short text image | 2000 tok / 141 s, line repeated 60× | **21 tok / 7.3 s**, clean |
+
+`python setup_glm_ocr.py` now applies this repair: it copies the base GGUF,
+writes the end-of-generation id with the `gguf` package, and builds the model
+from the repaired copy. It is idempotent (a model that already carries the id is
+left alone), skips rather than half-writes when there is not enough disk for the
+second 2.2 GB copy, and degrades to a warning — with the repetition guard still
+in place — when `gguf` is missing. **Re-run it after re-pulling `glm-ocr`**, and
+after upgrading a model created before this change.
+
+Two things worth recording because they are the obvious wrong fixes:
+
+- **The prompt is not the cause.** The native `Text Recognition:` prompt and the
+  shipped prompt both ran to `num_predict` on the same image. Measured
+  head-to-head, `stop: ["```"]` is what terminated generation unpatched — the
+  prompt only selects the output *format* (the native prompts switch to table
+  HTML / LaTeX).
+- **`PARAMETER stop "<|user|>"` cannot fix it.** A stop sequence is matched
+  against decoded output text, and `<|user|>` is a control token that never
+  appears there. Only the GGUF metadata decides what llama.cpp stops on.
 
 #### The model repeats itself — and that is not an incomplete transcript
 
@@ -412,7 +452,9 @@ themes), the recognition was **byte-perfect** and everything after it was
 repetition: it re-emits the page inside a code fence, invents a code block and
 re-emits that, or collapses into fence spam. On one 1600x900 page the real text
 ended at char 738 of a 2041-char transcript, with the same page transcribed
-twice and invented Python after it.
+twice and invented Python after it. That is the missing-EOG runaway described
+above; with the repair applied, the sampled pages stop at exactly the page text
+(1027 chars, no invented block).
 
 So a loop is not a recognition failure, and reporting it as one was wrong in
 three ways: the overlay said `OCR incomplete` about a transcript that had the
@@ -489,18 +531,26 @@ fences with indentation intact even while they stream.
 
 #### Why OCR sometimes took minutes (and what bounds it now)
 
-GLM-OCR runs at temperature 0 / top_k 1. Past the end of a page it does not
-stop: it latches onto the last token group (usually ``` ``` ```) and repeats it.
-Measured on a 4-core laptop CPU:
+GLM-OCR runs at temperature 0 / top_k 1, and without an end-of-generation token
+it cannot stop. Past the end of a page it re-emits the page (usually fence-
+wrapped) or latches onto the last token group and repeats that. Measured on a
+4-core laptop CPU, before the metadata repair:
 
 ```
-"Text recognition:"   59-94s   one line emitted 164×   1984 chars (~95% garbage)
+unpatched banner image   141s   2000 tok   the line emitted ~60x
+unpatched code page      152s   2000 tok   page re-emitted, then invented Python
 ```
+
+After `setup_glm_ocr.py` registers `<|user|>` as end-of-generation the same
+images stop on their own: **7.3 s / 21 tokens** and **70 s / 334 tokens**.
 
 Four independent bounds make a runaway impossible:
 
+- **The model's own end-of-generation token** stops it, once `setup_glm_ocr.py`
+  has registered it — this is the fix, and it lands at ~330 tokens for a dense
+  page instead of the cap (see [the real cause](#the-real-cause-glm-ocr-ships-without-an-end-of-generation-token));
 - the repetition guard abandons the stream as soon as its tail repeats earlier
-  output, which is what stops a 1024-token runaway in practice;
+  output, covering a model built without that repair;
 - `trim_repetition` removes whatever replay the guard let through;
 - `OCR_NUM_PREDICT` caps generated tokens per request — a backstop, **not** the
   fix, and raising it buys more duplication rather than a better transcript;
@@ -508,41 +558,102 @@ Four independent bounds make a runaway impossible:
   it is an httpx *read* timeout, and a looping generation keeps producing data,
   so it never fires.
 
+#### Prefill is the bottleneck — what actually reduces it
+
+On CPU the vision prefill dominates: ~23 s at 1024px against ~13 s of decode for
+a page. Every lever was measured on the same page with Ollama's own
+`prompt_eval_duration` (prompt cache defeated, min of repeated interleaved runs,
+since a thin laptop drifts several seconds between rounds).
+
+**Resolution — by far the biggest lever.** Image tokens scale with the square of
+the long edge, so prefill scales with it too:
+
+| long edge | image tokens | prefill |
+| --- | --- | --- |
+| 512px | 169 | 5.1 s |
+| 640px | 255 | 8.6 s |
+| 768px | 349 | 14.5 s |
+| 896px | 473 | 17.3 s |
+| 1024px | 617 | 23.1 s |
+| 1600px | 1849 | **98.6 s** |
+
+**Raising `OCR_MAX_DIMENSION` is a bad deal**, which is the trap: 1600px cost
+3× the prefill of 1024px and recovered 20 of 27 lines against 1024px's 18 —
+while the *same page* captured as a region at native density recovered 24 of 27
+lines at the 1024px price. Legibility is set by how large the glyphs are in the
+image the model finally sees, not by the long edge: downscaling a 1080p screen
+shrinks them, cropping does not. So **crop tighter rather than raise the
+dimension** (`SCREENSHOT_HOTKEY` region, not `SCREENSHOT_FULL_HOTKEY`).
+
+**Upscaling is pure cost.** A 420px drag-select recovered 13/14 lines whether it
+was sent as-is (5.6 s), at 512px (7.7 s) or at 1024px (37.7 s); a 560px one
+recovered 14/14 at 7.0 s and at 27.4 s. `OCR_MIN_DIMENSION` therefore defaults to
+`0` — the old `1024` made every region ~5× slower for no accuracy at all.
+
+**Threads: use every logical core, not every physical one.** Reverses the
+earlier note (that was decode-only, where the effect was small):
+
+| `num_thread` | prefill | decode |
+| --- | --- | --- |
+| 4 (physical) | 23.2 s | 18.7 tok/s |
+| 6 | 31.2 s | 23.7 tok/s |
+| **8 (logical)** | **18.5 s** | **23.9 tok/s** |
+| 10 | 28.9 s | 19.9 tok/s |
+| 12 | 29.8 s | 21.8 tok/s |
+
+`setup_glm_ocr.py` now derives this from `os.cpu_count()`. The vision encoder is
+memory-latency-bound, which is why hyperthreads help rather than fight for a
+core.
+
+**Two things that do not help:**
+
+- **Quantization.** `glm-ocr:q8_0` (1.6 GB) measured the same prefill as F16
+  (23.03 s vs 23.07 s at 1024px) and produced an identical transcript that still
+  ends on its own. (bge-m3 aside, the earlier decode-rate finding holds.)
+- **`num_batch`.** 64 → 2048 all landed within noise of each other (22.6-24.0 s);
+  the vision tower is a single large matmul per patch, not a decode loop.
+- **GPU.** The iGPU here (Iris Xe, no CUDA) is not a usable Ollama backend on
+  Windows — `num_gpu=99` changed nothing and measured *slower* than CPU.
+
 #### Measured latency (i7-1165G7, 4C/8T, GLM-OCR 1.1B F16, `num_ctx` 16384)
 
 The cost splits into three parts, and the split decides which knob matters:
 
 | stage | cost | scales with |
 | --- | --- | --- |
-| model load | ~6s, only after eviction | weight size |
-| vision prefill | **32s at 1024px**, 21s at 768, 6.5s at 512 | vision tokens (~60ms each) |
-| decode | ~15 tok/s → `num_tokens / 15` seconds | output length |
+| model load | ~2s warm, ~6s after eviction | weight size |
+| vision prefill | **23s at 1024px**, 14.5s at 768, 5.1s at 512 | image tokens, i.e. the long edge squared |
+| decode | ~24 tok/s at `num_thread=8` → `num_tokens / 24` seconds | output length |
 
-Because decode dominates a looping run but prefill dominates a clean one, both
-levers matter:
+So prefill dominates a clean run and decode dominates a looping one — but with
+the end-of-generation repair there is no loop, and a page lands at ~200-350
+output tokens, i.e. the prefill is the whole story. See [prefill is the
+bottleneck](#prefill-is-the-bottleneck--what-actually-reduces-it) for the lever
+measurements.
 
-- **The prompt is the biggest single win.** The stock `Text recognition:` prefix
-  *causes* the loop. `Transcribe all text in this image. Output only the text.`
-  terminates cleanly on the same image with **identical accuracy**
-  (100% ground-truth words both ways) and drops 59s → 12s. It is the shipped
-  default; the guard still backstops pages it does not fix.
-- **Image size trades accuracy for prefill.** Measured word recovery:
-  1024px → 100%, 768px → 95%, 640px → 100% (one sample), 512px → 76%.
-  `OCR_MAX_DIMENSION`/`OCR_MIN_DIMENSION` default to 1024 for fidelity; 768 saves
-  ~10s per new screenshot if you accept the risk.
+- **The prompt does not decide whether generation stops.** The stock
+  `Text recognition:` prefix was believed to *cause* the loop, but measured
+  head-to-head the native prompt and the shipped prompt both run to
+  `num_predict` — the cause is the missing end-of-generation token (see [the
+  real cause](#the-real-cause-glm-ocr-ships-without-an-end-of-generation-token)).
+  What the wording does control is the output *format*: the native prompts
+  switch the model to table HTML / LaTeX. The shipped prompt asks for the text
+  alone and keeps the output plain.
+- **A `stop: ["```"]` sequence terminates an unpatched model** (measured: 900 →
+  411 tokens on a code page, 2000 → 30 on a banner, lossless both times), which
+  is why the community threads recommend it. It is a workaround, not the fix,
+  and it is not shipped: for the *table* and *formula* tasks the correct stop is
+  different (`</table>`, `\n$$`), and stopping on `</table>` loses the closing
+  tag because Ollama excludes the matched string. Registering the EOG token
+  fixes every task at once and needs no per-task tuning.
 - **`OCR_KEEP_ALIVE=30m`**: Ollama evicts an idle model after 5 minutes and the
-  reload is ~6s (plus it re-pays prefill), which lands on the next screenshot.
-- **Quantization does not help here.** q8_0 and q4_K_M measured the same decode
-  rate as F16 (59-68s per 1024 tokens), and q4 returned an incomplete stream.
-- **Threads give ~15%**: `num_thread 8` vs `4` measured 13.6s vs 15.9s per 290
-  tokens; not worth oversubscribing 4 physical cores.
+  reload is a few seconds (plus it re-pays prefill), which lands on the next
+  screenshot.
 
-Steady state as shipped: **~10s per screenshot** for a clean page (A: 9.6s,
-C: 10.3s) and ~10.5s for a page the model loops on (guard stops it), versus
-43-94s before. Re-measured after the replay guard was added: **20s per
-screenshot** on a 1600x900 page that the model replays, with a transcript of
-exactly the page (588 chars) instead of 1531 chars of which most was the page
-repeated.
+Steady state as shipped, on a page-sized region: **~35s** at 1024px
+(23s prefill + decode), or **~13s** at 512px. Against the unpatched baseline of
+43-94s per screenshot with a duplicated transcript, and 141-152s for the
+runaways measured above.
 
 ### Text LLM providers
 
@@ -684,7 +795,7 @@ separate: `rag:N` counts retrieved snippets, `algo:Nc` the injected cheatsheet.
 ## Notes / troubleshooting
 
 - **PyQt6 DLL load failed**: prefer installing PyQt/Qt via conda-forge (`conda install -c conda-forge pyqt=6 qt-main`) and make sure VC++ 2015-2022 x64 runtime is installed.
-- **Screenshot/OCR failures**: the screenshot pipeline is isolated; failures show only in the Vision overlay and never stop ASR. `Ollama model missing` → run `ollama pull glm-ocr && python setup_glm_ocr.py`. `Ollama unreachable` → GhostPilot starts a local server by itself, so this means the endpoint is remote/unreachable, `OLLAMA_AUTOSTART=0`, or the `ollama` executable is not installed; check the log for the `src.ollama_boot` lines.
+- **Screenshot/OCR failures**: the screenshot pipeline is isolated; failures show only in the Vision overlay and never stop ASR. `Ollama model missing` → run `ollama pull glm-ocr && pip install gguf && python setup_glm_ocr.py`. `Ollama unreachable` → GhostPilot starts a local server by itself, so this means the endpoint is remote/unreachable, `OLLAMA_AUTOSTART=0`, or the `ollama` executable is not installed; check the log for the `src.ollama_boot` lines. OCR repeating a line/block or `repeat token` errors → the model was built without the end-of-generation repair: `pip install gguf && python setup_glm_ocr.py`, then restart GhostPilot.
 - **macOS / Linux dev mode**: `pip install -r requirements.txt` skips `pyaudiowpatch` automatically (it's `; sys_platform == "win32"`-gated) and installs `sounddevice` instead. Set `AUDIO_BACKEND=sounddevice` to use the mic, or install [BlackHole](https://existential.audio/blackhole/) (mac) / route to a Pulseaudio monitor (linux) for real system-audio loopback.
 - **KB auto-rebuild**: tweak with `KB_WATCH_INTERVAL_SEC` (default `5`; sets debounce window when QFileSystemWatcher is active; set `0` to disable both watcher and polling fallback).
 
