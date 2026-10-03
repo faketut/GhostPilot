@@ -114,7 +114,7 @@ from src.windows_api import set_dpi_awareness
 from src.asr_client import ASRClient
 from src.rag_manager import RAGManager
 from src.llm_engine import LLMEngine
-from src.hotkey_manager import HotkeyManager
+from src.hotkey_manager import HotkeyManager, is_unregistered, normalize_hotkey, note_unregistered
 from src.config import config
 from src import crash_logger
 from src import startup_mode
@@ -141,6 +141,30 @@ def _make_asr_client():
         except Exception as e:
             logging.getLogger(__name__).error(
                 f"Whisper backend requested but unavailable ({e}); falling back to Azure."
+            )
+    if backend == "sherpa":
+        try:
+            from src.sherpa_asr import SherpaOnnxASRClient
+            # Model load (and the one-time download) happens inside
+            # start_streaming, so a missing model surfaces as a log line rather
+            # than a launch failure.
+            return SherpaOnnxASRClient(
+                model=getattr(config, "SHERPA_MODEL", "zipformer-bilingual-zh-en"),
+                model_dir=getattr(config, "SHERPA_MODEL_DIR", ""),
+                num_threads=getattr(config, "SHERPA_NUM_THREADS", 0),
+                provider=getattr(config, "SHERPA_PROVIDER", "cpu"),
+                decoding_method=getattr(config, "SHERPA_DECODING_METHOD", ""),
+                hotwords_file=getattr(config, "SHERPA_HOTWORDS_FILE", ""),
+                hotwords_score=getattr(config, "SHERPA_HOTWORDS_SCORE", 1.5),
+                modeling_unit=getattr(config, "SHERPA_HOTWORDS_MODELING_UNIT", "cjkchar+bpe"),
+                rule1_min_trailing_silence=getattr(config, "SHERPA_RULE1_SILENCE_SEC", 2.4),
+                rule2_min_trailing_silence=getattr(config, "SHERPA_RULE2_SILENCE_SEC", 0.5),
+                rule3_min_utterance_length=getattr(config, "SHERPA_RULE3_UTTERANCE_SEC", 20.0),
+                autodownload=getattr(config, "SHERPA_AUTODOWNLOAD", True),
+            )
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"sherpa-onnx backend requested but unavailable ({e}); falling back to Azure."
             )
     return ASRClient(
         config.AZURE_SPEECH_KEY,
@@ -243,6 +267,101 @@ async def ui_updater(ui, ui_queue: asyncio.Queue):
             break
         except Exception as e:
             logger.error(f"UI Updater Error: {e}")
+
+
+def make_asr_router(*, text_queue, ui, ui_queue, llm_engine, loop):
+    """Build the ASR → classifier → LLM router coroutine.
+
+    Module level (rather than nested in ``run_pipelines``) so the state machine
+    can be tested directly: it is the only place that decides *when* a question
+    is complete, and its two finalization paths — the backend's own ``final``
+    event and the partial-silence timer — race each other. A race between them
+    produces a duplicated answer, which is not something to discover live.
+
+    ``speaker`` is display metadata only: it is interpolated into the log line,
+    the recorded transcript and the block header, and never branched on, so any
+    backend may report ``"Unknown"`` (sherpa-onnx, faster-whisper) freely.
+    """
+    state: dict = {"pending": None, "timer": None}
+
+    def _cancel_partial_timer():
+        timer = state["timer"]
+        if timer and not timer.done():
+            timer.cancel()
+        state["timer"] = None
+
+    async def _finalize_from_partial():
+        msg = state["pending"]
+        if not msg:
+            return
+        state["pending"] = None
+        try:
+            speaker = msg.get("speaker", "Unknown")
+            question = msg["text"]
+            logger.info(f"ASR Finalize (timeout) [{speaker}]: {question}")
+            ui.set_status("")
+            q_type = await llm_engine.classify_question_llm(question)
+            ui.show_thinking(q_type)
+            ui.append_block(f"[{speaker}] {question}\nA: ")
+            ui.set_streaming(True)
+            try:
+                await llm_engine.generate_answer_stream(question, ui_queue, q_type=q_type)
+            finally:
+                ui.set_streaming(False)
+        except asyncio.CancelledError:
+            ui.set_streaming(False)
+            logger.info("Text stream cancelled by user (finalize-from-partial).")
+        except Exception as e:
+            logger.error(f"ASR finalize error: {e}")
+
+    async def asr_router():
+        while True:
+            try:
+                msg = await text_queue.get()
+
+                if msg["type"] == "final":
+                    speaker = msg.get("speaker", "Unknown")
+                    question = msg["text"]
+                    logger.info(f"ASR Final [{speaker}]: {question}")
+                    from src.session_recorder import recorder as _rec
+                    _rec.log_transcript("final", f"[{speaker}] {question}")
+                    state["pending"] = None
+                    _cancel_partial_timer()
+                    q_type = await llm_engine.classify_question_llm(question)
+                    ui.set_status("")
+                    ui.show_thinking(q_type)
+                    ui.append_block(f"[{speaker}] {question}\nA: ")
+                    ui.set_streaming(True)
+                    try:
+                        await llm_engine.generate_answer_stream(question, ui_queue, q_type=q_type)
+                    except asyncio.CancelledError:
+                        logger.info("Text stream cancelled by user.")
+                    finally:
+                        ui.set_streaming(False)
+
+                elif msg["type"] == "partial":
+                    speaker = msg.get("speaker", "Unknown")
+                    state["pending"] = msg
+                    ui.set_status(f"[{speaker}] {msg['text']}")
+                    _cancel_partial_timer()
+
+                    # finalize on punctuation (quick heuristic)
+                    if getattr(config, "ASR_PUNCTUATION_FINALIZE", True) and msg["text"].rstrip().endswith(("?", "？", "。", "！", "!")):
+                        await _finalize_from_partial()
+                        continue
+
+                    async def _timer():
+                        await asyncio.sleep(getattr(config, "ASR_PARTIAL_SILENCE_MS", 650) / 1000.0)
+                        await _finalize_from_partial()
+
+                    state["timer"] = loop.create_task(_timer())
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"ASR Router Error: {e}")
+
+    return asr_router
 
 
 async def run_pipelines(app, loop, overlay_mode: str):
@@ -353,6 +472,9 @@ async def run_pipelines(app, loop, overlay_mode: str):
 
     hk_screenshot = None
     hk_interactions = []
+    # Combos whose registration failed — the footer/banner must not advertise
+    # a key that does nothing.
+    unregistered: list[str] = []
 
     def _apply_overlay_opacity():
         try:
@@ -404,16 +526,9 @@ async def run_pipelines(app, loop, overlay_mode: str):
             except Exception:
                 pass
 
-            # Hotkeys are registered once → rebuild to apply new bindings
+            # Hotkeys are registered once → rebuild to apply new bindings (this
+            # also repaints the overlays' hotkey hints).
             _rebuild_hotkeys()
-
-            # Refresh hotkey hints rendered in each overlay's footer
-            for _ov in (ui_asr, ui_vision):
-                if _ov is not None and hasattr(_ov, "refresh_footer"):
-                    try:
-                        _ov.refresh_footer()
-                    except Exception:
-                        pass
 
             # ASR language/keys changes require restarting the Azure transcriber
             _restart_asr()
@@ -739,7 +854,10 @@ async def run_pipelines(app, loop, overlay_mode: str):
         def _add_combo(combo: str) -> None:
             if not combo:
                 return
-            key = combo.lower()
+            # Dedupe on the *normalized* combo: 'caps' and 'caps lock' are the
+            # same physical key, and two managers on one key cannot both be
+            # unregistered (the library keeps removers in a global dict).
+            key = normalize_hotkey(combo).lower()
             if key in registered:
                 logger.warning(
                     "Skipping duplicate hotkey %r (%s) — already bound; "
@@ -763,7 +881,9 @@ async def run_pipelines(app, loop, overlay_mode: str):
         if backup.lower() != primary.lower():
             _add_combo(backup)
         for hk in hks:
-            hk.start()
+            if not hk.start():
+                logger.warning("%s: %r is not registered — that key does nothing.", label, hk.hotkey)
+                unregistered.append(hk.hotkey)
         if not hks and (primary or backup):
             logger.warning(f"No hotkey registered for {label} (empty or duplicate combos).")
         elif not hks:
@@ -771,7 +891,7 @@ async def run_pipelines(app, loop, overlay_mode: str):
         return hks
 
     def _rebuild_hotkeys():
-        nonlocal hk_screenshot, hk_interactions
+        nonlocal hk_screenshot, hk_interactions, unregistered
         try:
             if hk_screenshot is not None:
                 hk_screenshot.stop()
@@ -783,6 +903,7 @@ async def run_pipelines(app, loop, overlay_mode: str):
         except Exception:
             pass
         hk_interactions = []
+        unregistered = []
         registered_hotkeys: set[str] = set()
 
         logger.info(
@@ -799,22 +920,34 @@ async def run_pipelines(app, loop, overlay_mode: str):
 
         # Area screenshot hotkey
         if enable_vision:
-            hk_screenshot = HotkeyManager(config.SCREENSHOT_HOTKEY, on_screenshot, loop, suppress=False)
-            hk_screenshot.start()
-            _ss = (config.SCREENSHOT_HOTKEY or "").strip().lower()
-            if _ss:
-                registered_hotkeys.add(_ss)
+            hk_screenshot = HotkeyManager(config.SCREENSHOT_HOTKEY, on_screenshot, loop)
+            if hk_screenshot.start():
+                registered_hotkeys.add(hk_screenshot.hotkey.lower())
+            else:
+                logger.warning(
+                    "SCREENSHOT_HOTKEY=%r is not registered — that key does nothing.",
+                    hk_screenshot.hotkey,
+                )
+                unregistered.append(hk_screenshot.hotkey)
 
-        # Full-screen screenshot hotkey (separate binding)
+        # Full-screen screenshot hotkey (separate binding). No explicit suppress:
+        # a lone latching key (caps) is auto-suppressed so it does not also flip
+        # the OS toggle; anything else is left alone.
         full_combo = (getattr(config, "SCREENSHOT_FULL_HOTKEY", "") or "").strip() if enable_vision else ""
         if full_combo:
-            key = full_combo.lower()
+            hk_full = HotkeyManager(full_combo, on_screenshot_full, loop)
+            key = hk_full.hotkey.lower()
             if key in registered_hotkeys:
                 logger.warning("Skipping duplicate full-screen hotkey %r — already bound", full_combo)
             else:
-                registered_hotkeys.add(key)
-                hk_full = HotkeyManager(full_combo, on_screenshot_full, loop, suppress=False)
-                hk_full.start()
+                if hk_full.start():
+                    registered_hotkeys.add(key)
+                else:
+                    logger.warning(
+                        "SCREENSHOT_FULL_HOTKEY=%r is not registered — that key does nothing.",
+                        hk_full.hotkey,
+                    )
+                    unregistered.append(hk_full.hotkey)
                 # Keep a reference so it can be stopped on shutdown
                 hk_interactions.append(hk_full)
 
@@ -853,105 +986,57 @@ async def run_pipelines(app, loop, overlay_mode: str):
             registered=registered_hotkeys,
         )
 
+        if unregistered:
+            # One line for all of them: a dead binding used to be silent, and
+            # the overlay footer kept advertising the key.
+            logger.warning(
+                "Hotkey(s) NOT registered: %s — the name must be one the keyboard "
+                "library knows, and no other hook may own the key.",
+                ", ".join(unregistered),
+            )
+        # Also publish them for the overlay footer, which is the surface a
+        # windowed (pythonw) launch actually shows.
+        note_unregistered(unregistered)
+
+        # Footer hints are rendered when an overlay is constructed, which is
+        # *before* the first registration — repaint them here, the one place
+        # that knows the bindings changed, so a failed combo shows as dead.
+        for _ov in (ui_asr, ui_vision):
+            if _ov is not None and hasattr(_ov, "refresh_footer"):
+                try:
+                    _ov.refresh_footer()
+                except Exception:
+                    pass
+
     # Initial hotkeys registration (also supports runtime reloads)
     _rebuild_hotkeys()
 
     # ── ASR final transcript → Classifier → LLM ──────────────────────────
-    # ASR segmentation: finalize on punctuation or partial-silence timeout.
-    pending_partial: dict | None = None
-    partial_timer: asyncio.Task | None = None
-
-    def _cancel_partial_timer():
-        nonlocal partial_timer
-        if partial_timer and not partial_timer.done():
-            partial_timer.cancel()
-        partial_timer = None
-
-    async def _finalize_from_partial():
-        nonlocal pending_partial
-        if not pending_partial:
-            return
-        msg = pending_partial
-        pending_partial = None
-        try:
-            speaker = msg.get("speaker", "Unknown")
-            question = msg["text"]
-            logger.info(f"ASR Finalize (timeout) [{speaker}]: {question}")
-            ui_asr.set_status("")
-            q_type = await llm_engine.classify_question_llm(question)
-            ui_asr.show_thinking(q_type)
-            ui_asr.append_block(f"[{speaker}] {question}\nA: ")
-            ui_asr.set_streaming(True)
-            try:
-                await llm_engine.generate_answer_stream(
-                    question, ui_queue_asr, q_type=q_type
-                )
-            finally:
-                ui_asr.set_streaming(False)
-        except asyncio.CancelledError:
-            ui_asr.set_streaming(False)
-            logger.info("Text stream cancelled by user (finalize-from-partial).")
-        except Exception as e:
-            logger.error(f"ASR finalize error: {e}")
-
-    async def asr_router():
-        nonlocal pending_partial, partial_timer
-        while True:
-            try:
-                msg = await text_queue.get()
-
-                if msg["type"] == "final":
-                    speaker = msg.get("speaker", "Unknown")
-                    question = msg["text"]
-                    logger.info(f"ASR Final [{speaker}]: {question}")
-                    from src.session_recorder import recorder as _rec
-                    _rec.log_transcript("final", f"[{speaker}] {question}")
-                    pending_partial = None
-                    _cancel_partial_timer()
-                    q_type = await llm_engine.classify_question_llm(question)
-                    ui_asr.set_status("")
-                    ui_asr.show_thinking(q_type)
-                    ui_asr.append_block(f"[{speaker}] {question}\nA: ")
-                    ui_asr.set_streaming(True)
-                    try:
-                        await llm_engine.generate_answer_stream(
-                            question, ui_queue_asr, q_type=q_type
-                        )
-                    except asyncio.CancelledError:
-                        logger.info("Text stream cancelled by user.")
-                    finally:
-                        ui_asr.set_streaming(False)
-
-                elif msg["type"] == "partial":
-                    speaker = msg.get("speaker", "Unknown")
-                    pending_partial = msg
-                    ui_asr.set_status(f"[{speaker}] {msg['text']}")
-                    _cancel_partial_timer()
-
-                    # finalize on punctuation (quick heuristic)
-                    if getattr(config, "ASR_PUNCTUATION_FINALIZE", True) and msg["text"].rstrip().endswith(("?", "？", "。", "！", "!")):
-                        await _finalize_from_partial()
-                        continue
-
-                    async def _timer():
-                        await asyncio.sleep(getattr(config, "ASR_PARTIAL_SILENCE_MS", 650) / 1000.0)
-                        await _finalize_from_partial()
-
-                    partial_timer = loop.create_task(_timer())
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"ASR Router Error: {e}")
+    # The routing state machine lives at module level (make_asr_router) so it
+    # can be tested without building the app.
+    asr_router = make_asr_router(
+        text_queue=text_queue,
+        ui=ui_asr,
+        ui_queue=ui_queue_asr,
+        llm_engine=llm_engine,
+        loop=loop,
+    )
 
     if enable_asr:
         router_task = loop.create_task(asr_router())
 
     lines = [f"GhostPilot is running (overlay mode={overlay_mode})."]
+
+    def _combo_label(combo: str, fallback: str = "(unset)") -> str:
+        combo = (combo or "").strip()
+        if not combo:
+            return fallback
+        return f"{combo} (NOT REGISTERED)" if is_unregistered(combo) else combo
+
     if enable_vision:
         lines += [
-            f"  {config.SCREENSHOT_HOTKEY}  → Area screenshot → GLM-OCR → text LLM",
-            f"  {getattr(config, 'SCREENSHOT_FULL_HOTKEY', '') or '(unset)'}"
+            f"  {_combo_label(config.SCREENSHOT_HOTKEY)}  → Area screenshot → GLM-OCR → text LLM",
+            f"  {_combo_label(getattr(config, 'SCREENSHOT_FULL_HOTKEY', ''))}"
             "  → Full-screen screenshot → GLM-OCR → text LLM",
         ]
     if enable_asr:

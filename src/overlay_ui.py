@@ -36,6 +36,7 @@ from src.windows_api import (
     enable_window_stealth, set_window_interaction_mode, enable_mica, hide_from_taskbar,
 )
 from src.config import config
+from src.hotkey_manager import is_unregistered
 from src.settings_ui import SettingsUI
 from src import autostart
 from src import theme
@@ -393,6 +394,16 @@ def _clamp_geometry(geom: tuple[int, int, int, int]) -> tuple[int, int, int, int
     return x, y, w, h
 
 
+def _hotkey_hint_text(combo: str) -> str:
+    """A hotkey hint, marked when the binding never registered.
+
+    The overlay is the surface a windowed (`pythonw`) launch shows, so a key the
+    app failed to bind must not read as live here: a hint for a key that does
+    nothing is worse than no hint. Rendered as ``caps ✗``.
+    """
+    return f"{combo} ✗" if is_unregistered(combo) else combo
+
+
 class OverlayUI(QMainWindow):
     """`max_conversation_blocks`: trim ASR history to the last N blocks (split on `—` separators). None or 0 = no limit."""
 
@@ -589,9 +600,9 @@ class OverlayUI(QMainWindow):
         ss = getattr(config, "SCREENSHOT_HOTKEY", "")
         ss_full = getattr(config, "SCREENSHOT_FULL_HOTKEY", "")
         if ss:
-            bits.append(f"{ss} screenshot")
+            bits.append(f"{_hotkey_hint_text(ss)} screenshot")
         if ss_full:
-            bits.append(f"{ss_full} full")
+            bits.append(f"{_hotkey_hint_text(ss_full)} full")
         bits += [
             f"{getattr(config, 'ASR_INTERACTION_HOTKEY', 'alt+a')} drag",
             f"{getattr(config, 'FORCE_STEALTH_HOTKEY', 'alt+s')} stealth",

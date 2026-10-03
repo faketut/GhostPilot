@@ -110,3 +110,28 @@ def test_prose_formatting_applies_to_a_complete_segment(qt_app):
     """
     out = _render(qt_app, "Use **two pointers** and `while` here.\n", chunk=10_000)
     assert out.strip() == "Use two pointers and while here."
+
+
+# ── hotkey hints must not advertise a dead binding ───────────────────────
+
+
+def test_footer_marks_a_hotkey_that_never_registered(qt_app, monkeypatch):
+    """The overlay footer is the surface a windowed (`pythonw`) launch shows, so
+    the startup banner (a log line) cannot be the only place a failed binding is
+    reported — the footer must stop presenting the key as live."""
+    from src import hotkey_manager
+    from src.config import config
+
+    monkeypatch.setattr(config, "SCREENSHOT_HOTKEY", "alt+p", raising=False)
+    monkeypatch.setattr(config, "SCREENSHOT_FULL_HOTKEY", "caps", raising=False)
+    hotkey_manager.note_unregistered(["caps"])
+    w = OverlayUI(title="test", with_tray=False, start_y=0, accent="ASR")
+    try:
+        footer = w._build_footer_text()
+    finally:
+        w.close()
+        hotkey_manager.note_unregistered([])
+
+    assert "caps ✗ full" in footer
+    # The combo that did register keeps its plain hint.
+    assert "alt+p screenshot" in footer

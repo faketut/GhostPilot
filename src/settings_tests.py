@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Callable
 
 from PyQt6.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
+
+from src import sherpa_models
 
 logger = logging.getLogger(__name__)
 
@@ -216,3 +219,28 @@ def test_ocr(params):
 
 _PROVIDERS["ollama"] = test_ollama
 _PROVIDERS["ocr"] = test_ocr
+
+
+@_timed
+def test_sherpa(params):
+    """Local ASR: the sherpa-onnx package must import and the model be on disk.
+
+    Deliberately presence-only — loading a 200 MB model and decoding audio takes
+    seconds and the Settings dialog must stay responsive.
+    """
+    model = (params.get("SHERPA_MODEL") or "").strip() or sherpa_models.DEFAULT_MODEL
+    try:
+        import sherpa_onnx  # noqa: F401
+    except Exception as e:
+        return False, f"sherpa-onnx not installed ({type(e).__name__}) — pip install sherpa-onnx"
+    try:
+        files = sherpa_models.resolve(
+            model,
+            root=(params.get("SHERPA_MODEL_DIR") or "").strip() or None,
+            allow_download=False,
+        )
+    except Exception as e:
+        # These messages carry the fix ("run: python setup_sherpa_asr.py …",
+        # or the list of valid names), so they must not be cut mid-command.
+        return False, str(e)[:240]
+    return True, f"{Path(files['tokens']).parent.name} ready"

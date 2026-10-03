@@ -6,6 +6,14 @@ Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LL
 
 ## What's new in v0.10.0
 
+- **`caps` works as a hotkey (it never did)** — `SCREENSHOT_FULL_HOTKEY=Caps` shipped in `.env.example`, but the `keyboard` library has no `caps` alias (it knows `capslock` / `caps lock`), so `add_hotkey` raised inside `start()` where the failure was one log line: the documented key did nothing, silently. Key names are now normalised (`caps`, `caps-lock`, `capslock`, `Caps`) and a lone latching key is registered **suppressed**, so Caps Lock takes a screenshot *without* also flipping the toggle — a combo like `alt+p` stays unsuppressed, since suppressing it would swallow a key you type. Anything that still fails to register is reported at startup and rendered dead in the overlay footer (`caps ✗ full`). See [hotkeys](#hotkeys-two-overlays).
+- **A code-shaped screenshot is always answered with code, and the code is never missing** — the screenshot route now checks the OCR transcript's *shape* (a fence, or two line-level code markers) and routes it to the algorithm prompt even when the classifier called it `technical` — the shape whose answer is one tab-separated line with **no code block at all**. Reproduced live: an OCR'd listing classified as `technical`, override applied, answer came back as a complete `[I]` block. On top of that, an `algorithm` turn that finishes without any code block is re-asked **once** for exactly one fenced block; if that also fails the overlay says the code is missing instead of leaving prose that looks deliberate. Truncation is not repaired (the code is already on screen). See [question routing](#question-routing-which-answer-structure-you-get).
+- **Local ASR (sherpa-onnx)** — a third `ASR_BACKEND`, fully offline: no key, no per-minute billing, audio never leaves the machine. Models are genuinely streaming, so partials appear as words are spoken and the model's own endpoint detector ends the utterance. `pip install sherpa-onnx && python setup_sherpa_asr.py`, then `ASR_BACKEND=sherpa`. See [Local ASR](#local-asr-sherpa-onnx).
+- **English interview → Chinese answers** — `RESPONSE_LANGUAGE=zh` is what makes this work; the prompts answer in Chinese only when the question is *not* clearly English, and an English interview is always that case, so `auto`/`en` both produce English. See [answer language](#required-keys).
+- **English coding questions now reach the coding prompt** — the keyword classifier's vocabulary was almost entirely Chinese (数组 / 排序 / 复杂度) with a handful of English technique names, so "given an array of intervals, merge the overlapping ones" matched nothing and fell through to the *technical* prompt: one tab-separated line, **no code block**. That is the common case for an English interview. The classifier now knows English data structures and phrasing, distinguishes generic verbs (*describe*, *challenge*) from unambiguous story markers, and recognises CS subjects so a design question is not answered as a personal anecdote.
+- **A repeated OCR transcript is no longer treated as an incomplete one** — GLM-OCR reads a screenshot correctly and then keeps going: it re-emits the page inside a code fence, invents a code block and re-emits that, or collapses into fence spam. Measured across 768/1024/1280/1600 px, PNG/JPEG and light/dark/inverted screenshots, the recognition was byte-perfect every time and everything after it was repetition (one 1600x900 page: real text ended at char 738 of a 2041-char transcript). The old behaviour reported that as `OCR incomplete` — pointing users at `OCR_NUM_PREDICT`, which makes it *worse* — and fed the duplicate to the answer model as part of the question. Now the guard stops the stream as soon as the output replays itself (424 chunks/165s → 30-215 chunks/20s on the same images), the replay is cut out of the transcript, and only a genuine token-cap or wall-clock stop raises a warning. Detection is deliberately conservative, because a false positive would silently delete the question: a page of numbered requirements repeats its `Constraints:` line in every section, and a looser rule cut that 1910-char document to 287 chars. See [screenshot OCR](#screenshot-ocr-local-glm-ocr).
+- **A truncated screenshot is no longer answered silently** — when OCR hits its token cap, wall-clock budget or repetition guard, the partial transcript is still used (discarding it would throw away a usable question) but the shortfall is now written **into the answer body**. It used to be a status line, which the very next `answer_start` wiped — so a half-transcribed code listing was answered as though it were complete, with nothing on screen saying otherwise.
+- **sherpa-onnx language mismatches are reported** — `ASR_LANGUAGE` is an Azure setting; a local model's language is fixed at download time. A mismatch transcribes nothing while every status line still looks healthy, so the backend now states the model's coverage and warns when the two disagree (English audio + a zh-only model).
 - **Ollama starts with the app** — screenshot OCR needs Ollama, and nothing started or checked it: launching from the desktop icon with Ollama down meant every screenshot failed with a raw `ConnectError` in the overlay, with no hint of the remedy. GhostPilot now starts a **local** Ollama at launch when it is not answering (a remote `OLLAMA_BASE_URL` is never touched) and preloads the OCR model, so the first screenshot skips the ~6s model load. Ollama's own Startup-folder shortcut means this is usually a ~1ms probe. See [screenshot OCR](#screenshot-ocr-local-glm-ocr).
 - **Pick your overlay at launch** — GhostPilot opens a chooser (`Both overlays` / `Vision overlay only` / `ASR overlay only`) and can remember the answer; `python main.py --overlay vision` skips the dialog entirely. Vision-only mode never opens the loopback capture device and never starts the speech service — the right choice when you only want the screenshot → OCR → LLM route. See [Launch workflow](#launch-workflow-which-overlays-start).
 - **Faster OCR, measured** — the stock `Text recognition:` prompt made GLM-OCR run past the page and repeat itself (one line emitted 164×; 1984 chars of which ~95% was garbage, 59-94s of decode). The prompt now asks for the text alone and an explicit stop: **59s → 12s on the same image with identical accuracy**, backstopped by a repetition guard for pages where the model loops anyway. Model kept resident between screenshots, and the image is normalised to a legible long edge. Shipped steady state is ~10s per screenshot with no runaways; see [measured latency](#measured-latency-i7-1165g7-4c8t-glm-ocr-11b-f16-num_ctx-16384).
@@ -26,7 +34,7 @@ Desktop interview copilot for Windows: **invisible overlay** + **ASR → text LL
 ## Features
 
 - Click-through stealth overlays (ASR + Vision) with synced hotkeys.
-- WASAPI loopback capture → **Azure Speech** *or* **local faster-whisper** → segmenter → text LLM.
+- WASAPI loopback capture → **sherpa-onnx** *(local, offline)* *or* **Azure Speech** *or* **local faster-whisper** → segmenter → text LLM.
 - Region or full-screen screenshot → **local GLM-OCR (Ollama)** → text LLM, independent pipeline.
 - Multi-provider text LLM: **OpenAI · DeepSeek · Ollama (local)** through one OpenAI-compatible adapter; **Gemini** via `google-genai`.
 - Hybrid RAG over `knowledge/` (BM25 + dense embeddings, RRF fused; embeddings load lazily).
@@ -46,7 +54,7 @@ flowchart TD
   subgraph Audio[Audio / ASR Pipeline]
     AC["WASAPI Loopback Capture<br/>(silence padding)"]
     WD["Audio Watchdog<br/>(auto restart)"]
-    AZ["Azure Speech (partial/final)"]
+    AZ["ASR Backend<br/>sherpa-onnx (local) | Azure | whisper<br/>(partial/final + endpointing)"]
     SEG["Partial Segmenter<br/>(punct / timeout)"]
     RAG["RAGManager<br/>(knowledge/ chunks)"]
     TEXTLLM["Text LLM<br/>(OpenAI-compatible)"]
@@ -183,16 +191,184 @@ All config can be set via:
 
 ### Required keys
 
-- **ASR backend** (`ASR_BACKEND=azure` default, or `whisper` for offline):
+- **ASR backend** (`ASR_BACKEND=azure` default, `sherpa` or `whisper` for offline):
   - Azure: `SPEECH_KEY`, `SPEECH_REGION` (or `ENDPOINT`)
+  - sherpa-onnx: `pip install sherpa-onnx`, then `python setup_sherpa_asr.py` (see below). No key, no billing — audio never leaves the machine.
   - Whisper: `pip install faster-whisper`, then tune `WHISPER_MODEL` (default `small`), `WHISPER_DEVICE` (`auto`/`cpu`/`cuda`), `WHISPER_COMPUTE_TYPE` (`int8` default), `WHISPER_WINDOW_SEC` (default `2.5`).
 - **Text LLM** (pick one): `DEEPSEEK_API_KEY` (default) *or* `OPENAI_API_KEY` *or* a running Ollama server.
+- **Answer language**: `RESPONSE_LANGUAGE=auto | zh | en` (default `en`).
+  `zh` is the one to set for an **English interview answered in Chinese**: the
+  prompts themselves answer in Chinese only when the question is *not* clearly
+  English, and an English interview is exactly that case — so `auto` and `en`
+  both produce English answers. Only `zh` forces Chinese (and it applies to both
+  overlays).
 - **Screenshot OCR**: no key — a local Ollama server with the GLM-OCR model:
 
   ```powershell
   ollama pull glm-ocr
   python setup_glm_ocr.py        # creates glm-ocr-optimized (see ocr/GLM-Config)
   ```
+
+### Local ASR (sherpa-onnx)
+
+Runs the recognizer on your machine: no API key, no per-minute billing, and
+audio never leaves the box. Models are genuinely streaming, so partials appear
+as words are spoken and the model's own endpoint detector decides where an
+utterance ends.
+
+```powershell
+pip install sherpa-onnx
+python setup_sherpa_asr.py --list     # known models, with download sizes
+python setup_sherpa_asr.py            # default: zipformer bilingual zh+en (~511 MB)
+```
+
+Then set `ASR_BACKEND=sherpa` (`.env` or Settings → **Speech**). The model
+downloads on first use if you skip the script (`SHERPA_AUTODOWNLOAD=0` to
+forbid that and get the exact command in the log instead).
+
+Known models (`SHERPA_MODEL`):
+
+| Name | Languages | Download | Measured word recall\* |
+|---|---|---|---|
+| `zipformer-en-kroko` | English | **54 MB** | **96% / 94%** |
+| `zipformer-bilingual-zh-en` *(default)* | Chinese + English | 511 MB | 89% / 53% |
+| `zipformer-small-bilingual-zh-en` | Chinese + English | 458 MB | — |
+| `zipformer-zh-14M` | Chinese | 74 MB | — |
+| `zipformer-en-20M` | English | 128 MB | 50% / 35% |
+| `paraformer-bilingual-zh-en` | Chinese + English | 1048 MB | — |
+
+\* Word recall on two synthesized English sentences (see below). Not a benchmark —
+just enough to show the differences are large and not close.
+
+**For English interviews use `zipformer-en-kroko`.** It is the smallest model in
+the set *and* the most accurate on English, and it is the only one that returns
+properly cased, punctuated text (`tell me about a time when you had to deliver a
+project. How did you handle…`) instead of unpunctuated upper case.
+
+`zipformer-en-20M` is **not recommended**: on both test sentences it dropped the
+opening words of the utterance, returning `T UNDER A VERY TIGHT DEAD LINE` for
+"tell me about a time when you had to deliver a project under a very tight
+deadline". It was the worst of the three English-capable models at both accuracy
+and output quality. It is left in the registry because removing a documented
+option is a bigger call than flagging it.
+
+`SHERPA_MODEL` may also be a **path** to any already-extracted model directory
+containing `tokens.txt`, an `*encoder*.onnx` and a `*decoder*.onnx` (int8 is
+preferred automatically) — nothing is downloaded in that mode.
+
+Notes:
+
+- **Speaker labels are not available.** The local models emit `speaker:
+  "Unknown"`; Azure's `ConversationTranscriber` is the only backend here that
+  separates speakers. sherpa-onnx's diarization is offline-only.
+- **`ASR_LANGUAGE` does not apply here.** It is an Azure setting; a sherpa-onnx
+  model's language is fixed when you download it. The backend logs which
+  languages the selected model covers, and warns when `ASR_LANGUAGE` names one
+  it does not — English audio through a zh-only model transcribes to nothing
+  while every status line still looks healthy. For English interviews,
+  `zipformer-en-kroko` (54 MB) is both the smallest model covering English and
+  the most accurate one measured; the bilingual default covers both languages.
+- **Punctuation and casing depend on the model.** The bilingual and `en-20M`
+  models emit unpunctuated upper case (`TELL ME ABOUT A TIME WHEN YOU HAD TO
+  DELIVER A PROJECT`); `zipformer-en-kroko` emits proper sentence case and
+  punctuation. Either way nothing is added *server-side* the way Azure does it,
+  so GhostPilot's "finalize on `?`/`。`" heuristic (`ASR_PUNCTUATION_FINALIZE`)
+  only fires when the model itself produced the punctuation — with Kroko it will,
+  with the others it will not. Utterances otherwise end on the model's endpoint
+  signal or the silence timeout.
+- **`SHERPA_RULE2_SILENCE_SEC` must stay below `ASR_PARTIAL_SILENCE_MS`/1000**
+  (default 0.5 s vs 0.65 s). The router finalizes from the last partial on that
+  timer as well; if the timer won the race, the utterance would be answered
+  twice — once from the partial, once from the backend's final. The client logs
+  a warning at startup when the values are inverted.
+- **CPU cost is real** and shares cores with the OCR model. `SHERPA_NUM_THREADS`
+  defaults to `min(4, cpu_count)`; lower it if screenshot OCR slows down.
+- Accuracy on your own audio is the thing to measure. `setup_sherpa_asr.py`
+  ships no benchmark — compare against Azure on recorded interview audio before
+  switching a live setup over.
+
+### How the speech models were compared
+
+Two English sentences were synthesized with the Windows SAPI voice
+(`System.Speech.Synthesis`), resampled to 16 kHz, and fed through the real
+client in 160 ms chunks **in real time** — feeding faster than real time
+produces no events at all, because the recognizer is streaming and needs audio
+to arrive over wall-clock time to emit partials. Recall is the share of
+reference words recovered (order-insensitive).
+
+Caveat: synthesized speech is not a substitute for the real thing — no room
+noise, no accents, no crosstalk. It is enough to rank these models, not to
+predict your accuracy. For accents and noisy audio, measure on your own
+recordings. Rerun with `python setup_sherpa_asr.py --list` to see what is
+downloaded, and swap `SHERPA_MODEL` to compare.
+
+### Speaker labels (`speaker="Unknown"`)
+
+The sherpa-onnx and faster-whisper backends always report `speaker: "Unknown"`;
+only Azure's `ConversationTranscriber` separates speakers. **This does not
+affect transcription, routing or answering.** `speaker` is display metadata: it
+is interpolated into the log line, the recorded transcript and the block header,
+and is never compared, indexed or branched on anywhere in the codebase — so the
+pipeline behaves identically whether the label is `Unknown`, `Guest-1` or
+anything else. `tests/test_asr_router.py` pins that: the same utterance routes
+the same way for every label, including a missing key. The only consequence is
+that the overlay header reads `[Unknown] …` instead of a name.
+
+### Question routing (which answer structure you get)
+
+Each transcript is classified and answered with a different prompt, so the
+*shape* of what appears in the overlay depends on the routing. A coding question
+routed to the technical prompt produces a one-line answer with no code at all.
+
+| Routed as | Prompt | Structure in the overlay |
+| --- | --- | --- |
+| `behavioral` | behavioral.md | Four tagged lines — STAR `[S] [T] [A] [R]`, or WYEC `[W] [Y] [E] [C]` for fit/motivation questions |
+| `algorithm` | algorithm.md | `[U] [M] [P]` line, then `[I]` and a fenced code block, then `[R]` complexity |
+| `technical` | technical.md | One line, `[R] [E] [A] [C] [T]` separated by real tabs |
+
+A fast DeepSeek call classifies first; the keyword classifier is the fallback if
+that call fails. The order it applies is deliberate:
+
+1. unambiguous story/fit markers win outright — *"tell me about a time you
+   optimized a slow database query"* is a past story even though it names a
+   database;
+2. coding vocabulary → `algorithm`;
+3. concepts/systems vocabulary → `technical`, so *"what are the challenges of
+   eventual consistency"* is not answered as a personal anecdote;
+4. generic verbs alone (*describe*, *challenge*) only count as behavioral when no
+   CS subject was named;
+5. otherwise `technical`.
+
+Two guarantees sit on top of that, because getting the route wrong costs the
+*coding* answer entirely:
+
+- **A code-shaped screenshot is always answered with code.** The screenshot
+  route checks the OCR transcript's shape before trusting the classifier: a
+  transcript with a fence, or with two line-level code markers (a line ending in
+  `;`/`{`/`}` or opening with `def`/`class`/`function`/`for`/`return`/…), routes
+  to `algorithm` even when the classifier said `technical`. This is the
+  measured failure it fixes: an OCR'd listing has little prose for a classifier
+  to read, and the `technical` prompt answers in one tab-separated line — no
+  code at all (reproduced live: classifier returned `technical`, the override
+  turned it into a `[I]` block).
+- **An `algorithm` turn that produced no code block is re-asked once.** The
+  prompt requires the fence, but a model can still answer a coding question in
+  prose, and the user cannot tell that from a deliberate answer. One extra call
+  asks for exactly one fenced block; if that also fails, the overlay says so
+  instead of leaving a prose answer that looks intentional. Truncation is *not*
+  repaired — the code is already on screen and a re-ask cannot un-cut it.
+
+Overlay rendering of these structures is covered by `tests/test_overlay_render.py`
+(fence indentation under token streaming, open fences mid-stream, tab columns).
+The answer *shape* is asserted structurally in `tests/format_contract.py`, which
+parses each answer into prose and code segments and checks tags, line count,
+separators and language per segment — plus that Python blocks actually compile,
+which is how a truncated listing is caught (`tests/test_answer_format.py`).
+
+A measured caveat: across 9 live `technical` answers, 8 used the required real
+TAB separators and **1** returned a single line with bold-wrapped tags
+(`**[R]** … **[E]** …`) and no tabs. It stays readable, but the column layout is
+lost. If it recurs, the prompt is the thing to tune, not the renderer.
 
 ### Screenshot OCR (local GLM-OCR)
 
@@ -221,31 +397,116 @@ no hint that the fix was "start Ollama".
 | `OCR_TIMEOUT_SEC` | `180.0` | httpx *read* timeout (only fires when the stream stalls) |
 | `OCR_TOTAL_TIMEOUT_SEC` | `120.0` | Wall-clock budget for one recognition |
 | `OCR_KEEP_ALIVE` | `30m` | How long Ollama holds the model resident |
-| `OCR_NUM_PREDICT` | `1024` | Cap on tokens generated per screenshot |
-| `OCR_REPEAT_GUARD_LINES` | `12` | Abandon a stream repeating the same output |
+| `OCR_NUM_PREDICT` | `1024` | Cap on tokens generated per screenshot (a backstop — raising it buys more repetition, not a better transcript) |
+| `OCR_REPEAT_GUARD_LINES` | `12` | Abandon a stream repeating the same *line* 12× (the replay guard handles the rest) |
 
 Recognition streams token-by-token, so the Vision overlay shows the text as it
 is recognized (`OCR · …` in the status line) before the answer starts streaming.
 Failures are reported in the overlay only — the ASR pipeline is unaffected.
 
+#### The model repeats itself — and that is not an incomplete transcript
+
+GLM-OCR reads a screenshot correctly and then keeps going. Measured across every
+configuration tried (768/1024/1280/1600 px, PNG/JPEG, light/dark/inverted
+themes), the recognition was **byte-perfect** and everything after it was
+repetition: it re-emits the page inside a code fence, invents a code block and
+re-emits that, or collapses into fence spam. On one 1600x900 page the real text
+ended at char 738 of a 2041-char transcript, with the same page transcribed
+twice and invented Python after it.
+
+So a loop is not a recognition failure, and reporting it as one was wrong in
+three ways: the overlay said `OCR incomplete` about a transcript that had the
+whole page, the advice to raise `OCR_NUM_PREDICT` made it *worse* (a bigger cap
+buys more duplication), and the duplicate itself was fed to the answer model as
+part of the question. What happens now:
+
+- **The guard stops the stream** once the tail of the output repeats an earlier
+  part of it — measured 424 chunks/165s to 30-215 chunks/20s on the same images.
+- **`trim_repetition` cuts the replay out**, leaving the recognition. On the
+  measured transcripts: an exact cut back to the real page end where the text was
+  the only thing replayed, and removal of the duplicate plus the invented block
+  where it was not.
+- **No `OCR incomplete` warning for a loop.** Only a token-cap or wall-clock stop
+  can genuinely be missing its ending, and only that raises the warning.
+
+A `trim_repetition` false positive would silently delete the question, so the
+detection is deliberately conservative — it needs a long replay
+(`_MIN_DUPLICATE_CHARS`), or a doubled tail, or a run of structural markers, and
+is a no-op on everything the model produced once. That bar is measured, not
+guessed: a page of numbered requirements repeats its `Constraints:` line verbatim
+in every section, and a looser rule cut that 1910-char document down to 287 chars.
+
+**Known limit.** The model sometimes appends *one* invented code block after the
+page, without replaying it. Content emitted once is indistinguishable from
+recognition, and the only signal that separates them is "a code fence opened
+after a long run of prose" — which would also delete the legitimate sample code
+on a problem-statement-plus-code screenshot. That trade is not worth taking, so
+the block is left in the transcript; it follows the real question, and the answer
+model is already told the transcript may be mis-recognized. Measured rate on a
+synthetic 1600x900 page: 6 of 8 runs (the page itself was read correctly in all
+of them, and no run reported the transcript as incomplete).
+
+Three preprocessing levers were measured against that behaviour and none of them
+is the fix, which is why none of them shipped:
+
+| lever | measured |
+| --- | --- |
+| resolution 768 / 1024 / 1280 / 1600 px | 1024 is best; 1280/1600 *invent more* and cost 3-6× the prefill |
+| PNG vs JPEG q85 | identical transcripts |
+| inverting a dark screenshot (dark UI → black on white) | no improvement: 4/4 runs still appended an invented block |
+
+#### Incomplete recognition is visible in the answer
+
+A screenshot can still exceed a recognition budget (`OCR_NUM_PREDICT` tokens or
+`OCR_TOTAL_TIMEOUT_SEC` wall clock) without repeating itself, and then the text
+really can be missing its ending. The partial transcript is still used —
+discarding it would throw away a usable question — but the shortfall is written
+into the **answer body**, ahead of the answer:
+
+```
+[OCR] def merge(a, b):
+A: [⚠️ OCR incomplete — generation hit the 1024-token cap before stopping. The text may be missing its ending.]
+[U] 合并两个有序数组 …
+```
+
+It is answer text rather than a status line on purpose: the status line is
+cleared by the very next `answer_start`, so a half-transcribed listing used to be
+answered as though it were complete, with nothing left on screen saying
+otherwise.
+
+Measured on a 4-core laptop, for a full 1080p screen of code (~50 lines):
+`OCR_MAX_DIMENSION=1024` recognized it at ~94% character accuracy in ~59 s;
+raising the dimension to 1600 reached ~96% but took ~132 s — past the default
+`OCR_TOTAL_TIMEOUT_SEC=120`, so raising the dimension alone truncates. Change
+both or neither, and prefer a tighter crop over a bigger budget. On the page
+shapes measured for the repetition work, a higher resolution was also *worse*
+for content quality, not just slower: 1280/1600 px invented code that 1024 px
+did not.
+
+Note this bounds *recognition*. The answer's own code block is generated by the
+text model and is uncapped by default (`ANSWER_MAX_TOKENS=0`); the overlay renders
+fences with indentation intact even while they stream.
+
 #### Why OCR sometimes took minutes (and what bounds it now)
 
 GLM-OCR runs at temperature 0 / top_k 1. Past the end of a page it does not
 stop: it latches onto the last token group (usually ``` ``` ```) and repeats it.
-Measured on a 4-core laptop CPU, one 1080p screenshot:
+Measured on a 4-core laptop CPU:
 
 ```
 "Text recognition:"   59-94s   one line emitted 164×   1984 chars (~95% garbage)
 ```
 
-Three independent bounds make a runaway impossible:
+Four independent bounds make a runaway impossible:
 
-- `OCR_NUM_PREDICT` caps generated tokens per request.
+- the repetition guard abandons the stream as soon as its tail repeats earlier
+  output, which is what stops a 1024-token runaway in practice;
+- `trim_repetition` removes whatever replay the guard let through;
+- `OCR_NUM_PREDICT` caps generated tokens per request — a backstop, **not** the
+  fix, and raising it buys more duplication rather than a better transcript;
 - `OCR_TOTAL_TIMEOUT_SEC` caps wall-clock time. `OCR_TIMEOUT_SEC` alone cannot:
   it is an httpx *read* timeout, and a looping generation keeps producing data,
   so it never fires.
-- the repetition guard abandons a stream repeating the same output 12 times,
-  keeping the text recognized so far.
 
 #### Measured latency (i7-1165G7, 4C/8T, GLM-OCR 1.1B F16, `num_ctx` 16384)
 
@@ -278,11 +539,10 @@ levers matter:
 
 Steady state as shipped: **~10s per screenshot** for a clean page (A: 9.6s,
 C: 10.3s) and ~10.5s for a page the model loops on (guard stops it), versus
-43-94s before.
-
-If a recognition is cut short (cap, deadline, or repetition) the partial text is
-still used — the status line says so, so a partial transcript is never mistaken
-for a complete one.
+43-94s before. Re-measured after the replay guard was added: **20s per
+screenshot** on a 1600x900 page that the model replays, with a transcript of
+exactly the page (588 chars) instead of 1531 chars of which most was the page
+repeated.
 
 ### Text LLM providers
 
@@ -362,6 +622,15 @@ what did the cutting.
 - **Screenshot → OCR**:
   - `SCREENSHOT_HOTKEY` (default `alt+p`) — drag a region
   - `SCREENSHOT_FULL_HOTKEY` (default `alt+shift+p`) — capture the primary monitor
+    - `caps` works (aliases `caps-lock`, `capslock`, `Caps`), and any other name
+      the `keyboard` library knows. A lone latching key (`caps`, `num lock`,
+      `scroll lock`) is registered **suppressed**, so it takes the screenshot
+      without also flipping the OS toggle; a combo is left alone, because
+      suppressing `alt+p` would swallow a key you actually type.
+    - A combo the library cannot resolve (a typo, a key another hook owns) is
+      reported at startup — the banner writes `caps (NOT REGISTERED)` and the
+      overlay footer renders the hint as `caps ✗ full`. It used to fail
+      silently, leaving a documented hotkey that simply never fired.
 - **Both overlays interaction (click-through ↔ draggable, synced)**:
   - `ASR_INTERACTION_HOTKEY` / `ASR_INTERACTION_HOTKEY_BACKUP` (default `alt+a` / `ctrl+alt+a`)
 - **Vision overlay interaction (click-through ↔ draggable)**:
@@ -424,7 +693,7 @@ separate: `rag:N` counts retrieved snippets, `algo:Nc` the injected cheatsheet.
 Open from the system tray (right-click → Settings) or the gear button on the ASR overlay. Tabs:
 
 - **Startup** — which overlay(s) to open at launch (`Ask me each launch` / `Both` / `Vision only, no ASR service` / `ASR only`); applies to the next launch
-- **Azure** — Speech key / region / endpoint, ASR language, **ASR backend selector** (Azure ↔ Whisper)
+- **Speech** — **ASR backend selector** (Azure ↔ sherpa-onnx ↔ Whisper) with the selected backend's settings shown below it: Azure key/region/endpoint/language, or the sherpa-onnx model, model dir, endpointing, threads, decoding and hotwords file
 - **LLM** — grouped into *Text generation* / *Screenshot OCR (local)* / *API keys* / *Ollama (local)* sections. Provider dropdown + a master **Test selected providers** button (runs a text health check in parallel with an OCR check that the Ollama model is pulled)
 - **Hotkeys** — all bindings (primary + backup)
 - **Language** — LLM response language (`auto` / `zh` / `en`)
@@ -442,6 +711,7 @@ Secret fields all have a show/hide toggle. Most changes apply immediately — no
 - API keys preferred storage: **OS keyring** (`keyring`). Falls back to `.env` and `config.json` for compatibility.
 - `.env` and `config.json` are in `.gitignore` — never commit them. Plain-text fallback is plain text; treat the files accordingly.
 - The app never sends keys anywhere except to the configured providers (Azure / OpenAI / DeepSeek / Gemini / your local Ollama).
+- With `ASR_BACKEND=sherpa` (or `whisper`) speech never leaves the machine either: there is no speech key, and audio is not uploaded. The models are downloaded once from the k2-fsa GitHub releases / Hugging Face, and nothing is sent back afterwards.
 - Screenshots are OCR'd **locally** by Ollama; the image itself is never uploaded. Only the recognized text is sent to the configured text provider. Screenshots are not persisted to disk unless session recording is enabled.
 - Crash logs are written locally under the user data dir; they may contain prompts but never API keys.
 - For best operational hygiene: use a separate API key per machine and rotate periodically.

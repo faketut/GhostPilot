@@ -20,3 +20,7 @@ rank-bm25>=0.2.2
 # Optional: enables ASR_BACKEND=whisper (offline ASR). Not installed by default
 # because it pulls a model on first run and adds significant disk footprint.
 # faster-whisper>=1.0.0
+# Optional: enables ASR_BACKEND=sherpa (offline streaming ASR, no key).
+# Bundles its own onnxruntime, so it does not conflict with the pinned one above.
+# The acoustic models are separate downloads — see setup_sherpa_asr.py.
+# sherpa-onnx>=1.13.0

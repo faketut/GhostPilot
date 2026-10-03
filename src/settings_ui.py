@@ -30,6 +30,7 @@ from src import icons
 from src import settings_tests
 from src import prompt_loader
 from src import usage_log
+from src import sherpa_models
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ _TEXT_PROVIDER_OPTIONS = [
 ]
 _ASR_BACKEND_OPTIONS = [
     ("Azure Speech (cloud)", "azure"),
+    ("sherpa-onnx (local, offline)", "sherpa"),
     ("faster-whisper (local, offline)", "whisper"),
 ]
 _OVERLAY_MODE_OPTIONS = [
@@ -226,10 +228,32 @@ class SettingsUI(QDialog):
         startup.addRow("Overlay at launch:", mode_combo)
         tabs.addTab(startup_w, icons.icon("ghost"), "Startup")
 
-        # ── Tab: Azure ──
+        # ── Tab: Speech (ASR backend + per-backend settings) ──
+        speech = QVBoxLayout()
+        speech.setContentsMargins(0, 0, 0, 0)
+        speech.setSpacing(10)
+        speech_w = QWidget()
+        speech_w.setLayout(speech)
+
+        # The backend selector sits above both sections: it decides which one
+        # applies (_refresh_visibility hides the other).
+        head = QFormLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head_w = QWidget()
+        head_w.setLayout(head)
+        head.addRow("ASR backend:", self._add_combo(
+            "ASR_BACKEND",
+            getattr(config, "ASR_BACKEND", "azure"),
+            _ASR_BACKEND_OPTIONS,
+        ))
+        speech.addWidget(head_w)
+
         azure = QFormLayout()
         azure_w = QWidget()
         azure_w.setLayout(azure)
+        azure_w.setContentsMargins(0, 0, 0, 0)
+        azure.addRow(self._section_header("Azure Speech (cloud)"))
+        self._track_scoped(azure, "AZURE_SPEECH_KEY")  # section header row
         azure.addRow("Subscription key:",   self._add_secret("AZURE_SPEECH_KEY", config.AZURE_SPEECH_KEY, test="azure"))
         self._track_scoped(azure, "AZURE_SPEECH_KEY")
         azure.addRow("Region (e.g. eastus):", self._add_text("AZURE_SPEECH_REGION", config.AZURE_SPEECH_REGION))
@@ -238,12 +262,55 @@ class SettingsUI(QDialog):
         self._track_scoped(azure, "AZURE_SPEECH_ENDPOINT")
         azure.addRow("ASR language:", self._add_combo("ASR_LANGUAGE", config.ASR_LANGUAGE, _ASR_LANG_OPTIONS))
         self._track_scoped(azure, "ASR_LANGUAGE")
-        azure.addRow("ASR backend:", self._add_combo(
-            "ASR_BACKEND",
-            getattr(config, "ASR_BACKEND", "azure"),
-            _ASR_BACKEND_OPTIONS,
-        ))
-        tabs.addTab(azure_w, icons.icon("microphone"), "Azure")
+        speech.addWidget(azure_w)
+
+        # ── sherpa-onnx (local): registry name or a model directory path ──
+        sherpa = QFormLayout()
+        sherpa_w = QWidget()
+        sherpa_w.setLayout(sherpa)
+        sherpa_w.setContentsMargins(0, 0, 0, 0)
+        sherpa.addRow(self._section_header("sherpa-onnx (local, offline)"))
+        self._track_scoped(sherpa, "SHERPA_MODEL")  # section header row
+        sherpa_model = self._add_text("SHERPA_MODEL", getattr(config, "SHERPA_MODEL", sherpa_models.DEFAULT_MODEL))
+        sherpa_model.setToolTip(
+            "Registry name, or a path to an already-extracted model directory.\n"
+            "Known names: " + ", ".join(sherpa_models.MODELS)
+        )
+        sherpa_test_btn = QToolButton(); sherpa_test_btn.setToolTip("Check sherpa-onnx is installed and the model is on disk")
+        _set_btn_icon_or_text(sherpa_test_btn, "test")
+        sherpa_status = QLabel(""); sherpa_status.setMinimumWidth(160)
+        def _test_sherpa():
+            sherpa_test_btn.setEnabled(False)
+            sherpa_status.setText("… checking")
+            sherpa_status.setStyleSheet("color:#9aa; font-size:11px;")
+            settings_tests.run_test(
+                "sherpa", self._snapshot_for_test(),
+                lambda ok, msg: self._show_test_result(sherpa_test_btn, sherpa_status, ok, msg),
+            )
+        sherpa_test_btn.clicked.connect(_test_sherpa)
+        sherpa_row = QHBoxLayout()
+        sherpa_row.addWidget(sherpa_model, 1); sherpa_row.addWidget(sherpa_test_btn); sherpa_row.addWidget(sherpa_status)
+        sherpa_model_w = QWidget(); sherpa_model_w.setLayout(sherpa_row)
+        sherpa.addRow("Model:", sherpa_model_w)
+        self._track_scoped(sherpa, "SHERPA_MODEL")
+        sherpa_dir = self._add_text("SHERPA_MODEL_DIR", getattr(config, "SHERPA_MODEL_DIR", ""))
+        sherpa_dir.setToolTip(f"Where models are downloaded. Empty → {sherpa_models.default_root()}")
+        sherpa.addRow("Model dir (optional):", sherpa_dir)
+        self._track_scoped(sherpa, "SHERPA_MODEL_DIR")
+        sherpa.addRow("End of utterance (sec of silence):", self._add_text(
+            "SHERPA_RULE2_SILENCE_SEC", str(getattr(config, "SHERPA_RULE2_SILENCE_SEC", 0.5))))
+        self._track_scoped(sherpa, "SHERPA_RULE2_SILENCE_SEC")
+        sherpa.addRow("CPU threads (0 = auto):", self._add_text(
+            "SHERPA_NUM_THREADS", str(getattr(config, "SHERPA_NUM_THREADS", 0))))
+        self._track_scoped(sherpa, "SHERPA_NUM_THREADS")
+        sherpa.addRow("Decoding:", self._add_text("SHERPA_DECODING_METHOD", getattr(config, "SHERPA_DECODING_METHOD", "")))
+        self._track_scoped(sherpa, "SHERPA_DECODING_METHOD")
+        sherpa.addRow("Hotwords file:", self._add_text("SHERPA_HOTWORDS_FILE", getattr(config, "SHERPA_HOTWORDS_FILE", "")))
+        self._track_scoped(sherpa, "SHERPA_HOTWORDS_FILE")
+        speech.addWidget(sherpa_w)
+        speech.addStretch(1)
+
+        tabs.addTab(speech_w, icons.icon("microphone"), "Speech")
 
         # ── Tab: LLM ──
         llm = QFormLayout()
@@ -474,6 +541,14 @@ class SettingsUI(QDialog):
             "AZURE_SPEECH_REGION": a == "azure",
             "AZURE_SPEECH_ENDPOINT": a == "azure",
             "ASR_LANGUAGE":        a == "azure",
+            # sherpa-onnx carries its own language+endpointing, so these rows
+            # only appear when that backend is selected.
+            "SHERPA_MODEL":        a == "sherpa",
+            "SHERPA_MODEL_DIR":    a == "sherpa",
+            "SHERPA_RULE2_SILENCE_SEC": a == "sherpa",
+            "SHERPA_NUM_THREADS":  a == "sherpa",
+            "SHERPA_DECODING_METHOD": a == "sherpa",
+            "SHERPA_HOTWORDS_FILE": a == "sherpa",
         }
         for layout, row, key in self._scoped_rows:
             if key in show:

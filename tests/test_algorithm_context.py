@@ -120,13 +120,18 @@ def test_cheatsheet_is_injected_as_its_own_reference_block():
 async def test_algorithm_turn_injects_once_and_reports_rag_hits_zero(cheatsheet):
     """The cheatsheet reaches the model once, and the footer's `rag:N` stays 0
     — it is an injection, not a retrieval."""
-    sent: dict = {}
+    calls: list[list[dict]] = []
 
     def _chat_stream(messages, **_kw):
-        sent["messages"] = messages
+        calls.append(messages)
 
         async def _gen():
-            yield types.SimpleNamespace(text="ok", usage=None, finish_reason="stop")
+            # A compliant algorithm answer, so the turn is one call: a prose-only
+            # answer would (correctly) trigger the code repair and this test is
+            # about the injection, not the repair.
+            yield types.SimpleNamespace(
+                text="[I]\n```python\npass\n```", usage=None, finish_reason="stop",
+            )
 
         return _gen()
 
@@ -137,7 +142,8 @@ async def test_algorithm_turn_injects_once_and_reports_rag_hits_zero(cheatsheet)
     ui: asyncio.Queue = asyncio.Queue()
     await eng.generate_answer_stream("sum two digits", ui, q_type="algorithm")
 
-    msgs = sent["messages"]
+    assert len(calls) == 1
+    msgs = calls[0]
     assert sum(m["content"].count("PATTERN: sliding window") for m in msgs) == 1
     # The system message still carries the route's instructions (UMPIR spec).
     assert "[I]" in msgs[0]["content"]
@@ -154,13 +160,15 @@ async def test_algorithm_turn_injects_once_and_reports_rag_hits_zero(cheatsheet)
 async def test_prompt_override_still_reaches_the_algorithm_turn(cheatsheet):
     """Session replay A/B-tests prompts through ``override_prompts``; the system
     message remains the single delivery point for the route's instructions."""
-    sent: dict = {}
+    calls: list[list[dict]] = []
 
     def _chat_stream(messages, **_kw):
-        sent["messages"] = messages
+        calls.append(messages)
 
         async def _gen():
-            yield types.SimpleNamespace(text="ok", usage=None, finish_reason="stop")
+            yield types.SimpleNamespace(
+                text="[I]\n```python\npass\n```", usage=None, finish_reason="stop",
+            )
 
         return _gen()
 
@@ -171,4 +179,5 @@ async def test_prompt_override_still_reaches_the_algorithm_turn(cheatsheet):
     with prompt_loader.override_prompts({"algorithm": "CUSTOM ALGO PROMPT"}):
         await eng.generate_answer_stream("q", asyncio.Queue(), q_type="algorithm")
 
-    assert sent["messages"][0]["content"] == "CUSTOM ALGO PROMPT" + _lang_suffix()
+    assert len(calls) == 1
+    assert calls[0][0]["content"] == "CUSTOM ALGO PROMPT" + _lang_suffix()

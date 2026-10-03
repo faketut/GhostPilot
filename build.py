@@ -80,6 +80,11 @@ HIDDEN_IMPORTS = [
     "src.session_recorder",
     "src.crash_logger",
     "src.secret_store",
+    # Optional local ASR backends (lazy-imported; the app runs without them)
+    "sherpa_onnx",
+    "src.sherpa_asr",
+    "src.sherpa_models",
+    "src.whisper_asr",
 ]
 
 # ── Helpers ────────────────────────────────────────────────────────────────

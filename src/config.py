@@ -54,7 +54,8 @@ class Config:
     # ASR recognition language. zh-CN for Chinese, en-US for English, etc.
     ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "en-US")
 
-    # ASR backend: "azure" (cloud, default) or "whisper" (local via faster-whisper).
+    # ASR backend: "azure" (cloud, default), "whisper" (local via faster-whisper)
+    # or "sherpa" (local via sherpa-onnx — streaming, model downloads on first use).
     ASR_BACKEND = os.getenv("ASR_BACKEND", "azure").strip().lower()
     # faster-whisper knobs (only used when ASR_BACKEND=whisper).
     WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
@@ -62,6 +63,38 @@ class Config:
     WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
     # How many seconds of audio to buffer before each whisper inference pass.
     WHISPER_WINDOW_SEC = _env_float("WHISPER_WINDOW_SEC", 2.5)
+
+    # sherpa-onnx knobs (only used when ASR_BACKEND=sherpa).
+    # Fully local: no key, no per-minute billing, audio never leaves the machine.
+    # SHERPA_MODEL is a registry name (src/sherpa_models.py — see
+    # `python setup_sherpa_asr.py --list`) or a path to an already-extracted
+    # model directory holding tokens.txt + *encoder*.onnx + *decoder*.onnx.
+    SHERPA_MODEL = os.getenv("SHERPA_MODEL", "zipformer-bilingual-zh-en")
+    # Where registry models are stored. Empty → ~/.ghostpilot/models/sherpa-onnx.
+    SHERPA_MODEL_DIR = os.getenv("SHERPA_MODEL_DIR", "")
+    # Fetch the model on first use when it is missing (one time: 74 MB – 1 GB).
+    SHERPA_AUTODOWNLOAD = os.getenv("SHERPA_AUTODOWNLOAD", "1") != "0"
+    # onnxruntime threads. 0 → min(4, cpu_count) — ASR shares the CPU with the
+    # OCR model, so it is deliberately not "all cores".
+    SHERPA_NUM_THREADS = _env_int("SHERPA_NUM_THREADS", 0)
+    SHERPA_PROVIDER = os.getenv("SHERPA_PROVIDER", "cpu")  # cpu | cuda | coreml
+    # Endpointing. RULE2 (end of utterance after speech) MUST stay below
+    # ASR_PARTIAL_SILENCE_MS/1000, or main.py's partial timer answers the
+    # utterance first and the model's final produces a second, duplicate answer.
+    SHERPA_RULE1_SILENCE_SEC = _env_float("SHERPA_RULE1_SILENCE_SEC", 2.4)   # before any text
+    SHERPA_RULE2_SILENCE_SEC = _env_float("SHERPA_RULE2_SILENCE_SEC", 0.5)   # after speech
+    SHERPA_RULE3_UTTERANCE_SEC = _env_float("SHERPA_RULE3_UTTERANCE_SEC", 20.0)  # hard cap
+    # "greedy_search" (cheapest) or "modified_beam_search" (better accuracy, and
+    # required for hotwords). Empty → modified_beam_search when a hotwords file
+    # is set, else greedy_search.
+    SHERPA_DECODING_METHOD = os.getenv("SHERPA_DECODING_METHOD", "")
+    # Vocabulary biasing (product names, acronyms). File format is BPE/CJKchar
+    # tokens, one phrase per line — generate it with the model's own bpe.model:
+    #   sherpa-onnx-cli text2token --tokens <dir>/tokens.txt --bpe-model <dir>/bpe.model \
+    #       --texts "your phrase" out.txt
+    SHERPA_HOTWORDS_FILE = os.getenv("SHERPA_HOTWORDS_FILE", "")
+    SHERPA_HOTWORDS_SCORE = _env_float("SHERPA_HOTWORDS_SCORE", 1.5)
+    SHERPA_HOTWORDS_MODELING_UNIT = os.getenv("SHERPA_HOTWORDS_MODELING_UNIT", "cjkchar+bpe")
 
     # LLM Settings
     # Answer model. DeepSeek-V4.1-Flash ("deepseek-flash") is the current
